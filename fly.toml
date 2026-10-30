@@ -5,6 +5,8 @@
 
 app = 'dnd-with-scheduler'
 primary_region = 'ord'
+kill_signal = "SIGTERM"
+kill_timeout = 20
 
 [build]
   dockerfile = 'Dockerfile'

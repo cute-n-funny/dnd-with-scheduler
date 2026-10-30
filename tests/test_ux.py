@@ -71,7 +71,7 @@ def ui_from_bot():
     discord = SimpleNamespace(
         Embed=FakeEmbed, SelectOption=FakeOption, ui=SimpleNamespace(
             View=FakeView, Select=FakeSelect, Button=FakeButton),
-        ButtonStyle=SimpleNamespace(success=1, danger=2, secondary=3))
+        ButtonStyle=SimpleNamespace(success=1, danger=2, secondary=3, primary=4))
     from datetime import datetime as dt
     ns = {'discord': discord, 'datetime': dt, 'Counter': Counter, 'timedelta': timedelta,
           'utcnow': lambda: datetime.now(timezone.utc),
@@ -158,11 +158,21 @@ class UXTests(unittest.TestCase):
                     panel = self.ui['VotePanel'](bot, record, 99, slots,
                                                 await store.user_votes(9, 2, 99))
                     self.assertEqual(panel.selected, {'2026-12-03T14:00'})
+                    panel.day_select.values = ['2026-12-03', '2026-12-04']
+                    await panel.choose_days(SimpleNamespace(response=FakeResponse()))
                     panel.time_select.values = ['14:00', '16:00']
                     await panel.choose_times(SimpleNamespace(response=FakeResponse()))
+                    await panel.apply_times(SimpleNamespace(response=FakeResponse()))
+                    self.assertEqual(len(panel.selected), 4)
+                    # Both dates received both chosen times (cartesian product).
+                    self.assertIn('2026-12-04T16:00', panel.selected)
+                    self.assertIn('2026-12-03T16:00', panel.selected)
+                    # Add the last time only for the second date.
                     panel.day_select.values = ['2026-12-04']
-                    await panel.choose_day(SimpleNamespace(response=FakeResponse()))
-                    await panel.select_all(SimpleNamespace(response=FakeResponse()))
+                    await panel.choose_days(SimpleNamespace(response=FakeResponse()))
+                    panel.time_select.values = ['18:00']
+                    await panel.choose_times(SimpleNamespace(response=FakeResponse()))
+                    await panel.apply_times(SimpleNamespace(response=FakeResponse()))
                     self.assertEqual(len(await store.user_votes(9, 2, 99)), 1)  # still draft
                     interaction = SimpleNamespace(user=SimpleNamespace(id=99),response=FakeResponse())
                     await panel.save(interaction)
@@ -170,8 +180,8 @@ class UXTests(unittest.TestCase):
                     self.assertIn('Saved!', interaction.response.edit['embed'].description)
                     self.assertEqual(bot.refreshed, 1)
                     panel.day_select.values = ['2026-12-03']
-                    await panel.choose_day(SimpleNamespace(response=FakeResponse()))
-                    await panel.clear_day(SimpleNamespace(response=FakeResponse()))
+                    await panel.choose_days(SimpleNamespace(response=FakeResponse()))
+                    await panel.clear_dates(SimpleNamespace(response=FakeResponse()))
                     await panel.save(interaction)
                     self.assertEqual(len(await store.user_votes(9, 2, 99)), 3)
                 asyncio.run(test())
@@ -183,7 +193,7 @@ class UXTests(unittest.TestCase):
         times = [f'{h:02d}:00' for h in range(10,22)]
         c = {'title':'D'*100, 'description':'a'*900, 'weeks':4,
              'days':[3,4,5,6], 'times':times, 'poll_duration':3,
-             'timezone':tz, 'dm_id':111}
+             'timezone':tz, 'dm_id':111, 'attendee_limit':8}
         end = datetime.now(timezone.utc) + timedelta(days=3)
         record = {'config': c, 'poll_deadline':end.isoformat()}
         emb = self.ui['build_poll_embed'](record, [])

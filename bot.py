@@ -63,7 +63,7 @@ def is_admin(user):
 def config_defaults(guild, creator_id, channel_id):
     return dict(title="Title", description="Description for event", dm_id=creator_id,
                 weeks=2, days=[3, 4, 5, 6], times=["14:00", "16:00", "18:00"],
-                poll_duration=3, attendee_limit=12, poll_after_event=3,
+                poll_duration=3, attendee_limit=8, poll_after_event=3,
                 reminder_before_event=6, ping_role_id=guild.id,
                 event_duration=4, timezone=TZ_NAME, channel_id=None, looping=True)
 
@@ -106,8 +106,8 @@ def build_poll_embed(record, votes, *, closed=False, winner=None):
     for vote in votes:
         day_voters.setdefault(vote["slot"][:10], set()).add(vote["user_id"])
     members = len({v["user_id"] for v in votes})
-    instructions = ("Press **Set My Availability**, choose a date, select **all** times "
-                    "you can attend, then **Save Availability**. You can edit later.")
+    instructions = ("Press **Set My Availability**, select multiple dates and times, "
+                    "apply your availability, then **Save Availability**. You can edit later.")
     test_note = ("\n🧪 **Test mode:** closes after 1 minute; Test Event starts "
                  "1 minute after closing regardless of votes. No pings or reminders."
                  if is_test(c) else "")
@@ -120,7 +120,8 @@ def build_poll_embed(record, votes, *, closed=False, winner=None):
                      f"{len(votes)} selected slots\n"
                      f"**Deadline:** <t:{int(end.timestamp())}:F> "
                      f"(<t:{int(end.timestamp())}:R>)\n"
-                     f"**DM:** <@{c['dm_id']}> · **Times shown in:** `{c['timezone']}`"
+                     f"**DM:** <@{c['dm_id']}> · **Minimum to win:** {c['attendee_limit']} voters at the same time · "
+                     f"**Timezone:** `{c['timezone']}`"
                      f"{test_note}\n\n{instructions}"))
     if winner:
         if is_test(c):
@@ -148,7 +149,7 @@ def build_poll_embed(record, votes, *, closed=False, winner=None):
         embed.add_field(name=f"📆 {date_title}  —  {n} available", value="\n".join(lines), inline=False)
     if not visible:
         embed.add_field(name="No remaining dates", value="No valid future slots in this poll.", inline=False)
-    embed.set_footer(text="The winning day uses unique voters; the most popular time wins within that day. DM-voted dates take priority.")
+    embed.set_footer(text="Earliest slot reaching the attendee limit in distinct voters wins; if none qualifies, popularity decides. DM-voted dates take priority.")
     return embed
 
 
@@ -203,7 +204,7 @@ class PollMessageView(discord.ui.View):
 
 
 class VotePanel(discord.ui.View):
-    """Draft availability across several days; one explicit, atomic Save action."""
+    """Batch-apply selected time(s) to selected date(s); save draft atomically."""
     def __init__(self, bot, record, user_id, slots, saved_votes):
         super().__init__(timeout=600)
         self.bot, self.guild_id, self.cycle, self.user_id = (
@@ -211,132 +212,177 @@ class VotePanel(discord.ui.View):
         self.timezone = record["config"]["timezone"]
         self.slots = set(slots)
         self.days = sorted({slot[:10] for slot in slots})
-        self.day = self.days[0]
+        self.times = sorted({slot[11:] for slot in slots})
+        self.target_days = {self.days[0]}
+        self.target_times = set()
         self.selected = {v["slot"] for v in saved_votes if v["slot"] in self.slots}
         self.saved_slots = set(self.selected)
         self.note = ""
-        self.day_select = discord.ui.Select(placeholder="Choose a date", row=0, options=self.day_options())
-        self.day_select.callback = self.choose_day
+        self.day_select = discord.ui.Select(
+            placeholder="Choose one or more dates", row=0, min_values=1,
+            max_values=len(self.days), options=self.day_options())
+        self.day_select.callback = self.choose_days
         self.add_item(self.day_select)
-        self.time_select = discord.ui.Select(placeholder="Select every available time", row=1,
-                                             min_values=1, max_values=1, options=self.time_options())
+        self.time_select = discord.ui.Select(
+            placeholder="Choose one or more times", row=1, min_values=1,
+            max_values=len(self.times), options=self.time_options())
         self.time_select.callback = self.choose_times
         self.add_item(self.time_select)
-        self.redraw_times()
-
-        save = discord.ui.Button(label="Save Availability", emoji="💾", row=2,
-                                 style=discord.ButtonStyle.success)
-        save.callback = self.save
-        self.add_item(save)
+        add = discord.ui.Button(label="Add Times to Dates", emoji="✅", row=2,
+                                style=discord.ButtonStyle.primary)
+        add.callback = self.apply_times
+        self.add_item(add)
+        remove = discord.ui.Button(label="Remove These Times", row=2,
+                                   style=discord.ButtonStyle.secondary)
+        remove.callback = self.remove_times
+        self.add_item(remove)
         all_times = discord.ui.Button(label="Select All Times", row=3,
                                       style=discord.ButtonStyle.secondary)
         all_times.callback = self.select_all
         self.add_item(all_times)
-        clear = discord.ui.Button(label="Clear This Day", row=3,
+        clear = discord.ui.Button(label="Clear Selected Dates", row=3,
                                   style=discord.ButtonStyle.secondary)
-        clear.callback = self.clear_day
+        clear.callback = self.clear_dates
         self.add_item(clear)
+        save = discord.ui.Button(label="Save Availability", emoji="💾", row=4,
+                                 style=discord.ButtonStyle.success)
+        save.callback = self.save
+        self.add_item(save)
         prior = discord.ui.Button(label="Copy Previous Preferences", row=4,
                                   style=discord.ButtonStyle.secondary)
         prior.callback = self.copy_previous
         self.add_item(prior)
 
     def day_options(self):
-        options = []
+        result = []
         for day in self.days:
-            num = sum(slot.startswith(day) for slot in self.selected)
-            options.append(discord.SelectOption(
+            count = sum(slot.startswith(day) for slot in self.selected)
+            result.append(discord.SelectOption(
                 label=datetime.fromisoformat(day).strftime("%a %b %d, %Y"), value=day,
-                description=f"{num} time{'s' if num != 1 else ''} selected",
-                default=(day == self.day)))
-        return options
+                description=f"{count} time{'s' if count != 1 else ''} in draft",
+                default=day in self.target_days))
+        return result
 
     def time_options(self):
-        times = sorted({slot[11:] for slot in self.slots if slot.startswith(self.day)})
         return [discord.SelectOption(label=time_label(t), value=t,
-                                     default=(f"{self.day}T{t}" in self.selected)) for t in times]
+                                     default=t in self.target_times) for t in self.times]
 
-    def redraw_times(self):
+    def redraw(self):
+        # Keep menu defaults in sync after each interaction, including edits/copy.
         self.day_select.options = self.day_options()
-        opts = self.time_options()
-        self.time_select.options = opts
-        self.time_select.max_values = len(opts)
+        self.time_select.options = self.time_options()
 
     def embed(self, note=""):
-        total = len(self.selected)
-        days = len({slot[:10] for slot in self.selected})
-        current = [time_label(s[11:]) for s in sorted(self.selected) if s.startswith(self.day)]
-        selected_text = ", ".join(current) if current else "None selected yet"
-        unsaved = "⚠️ **Unsaved changes** — press Save Availability." if self.selected != self.saved_slots else "✅ All changes saved."
-        return discord.Embed(title="🗳️ Your D&D Availability", color=0x5865F2,
-            description=(f"**Date:** {datetime.fromisoformat(self.day).strftime('%a, %b %d, %Y')}\n"
-                         f"**Times for this date:** {selected_text}\n"
-                         f"**Total:** {total} time slot(s) across {days} date(s)\n"
-                         f"**Timezone:** `{self.timezone}`\n\n"
-                         "Choose a date and **select multiple times** from the dropdown. "
-                         "Repeat for other dates, then press **Save Availability** once.\n"
-                         "Use **Clear This Day** to select no times.\n\n"
-                         f"{unsaved}\n{note}"))
+        count = len(self.selected)
+        dates = len({slot[:10] for slot in self.selected})
+        chosen_dates = ", ".join(datetime.fromisoformat(d).strftime("%b %d")
+                                 for d in sorted(self.target_days))
+        chosen_times = ", ".join(time_label(t) for t in sorted(self.target_times)) or "None yet"
+        preview = []
+        for day in self.days:
+            times = [time_label(s[11:]) for s in sorted(self.selected) if s.startswith(day)]
+            if times:
+                preview.append(f"• **{datetime.fromisoformat(day).strftime('%a %b %d')}** — {', '.join(times)}")
+        draft_summary = "\n".join(preview) or "No availability selected yet."
+        saved = ("⚠️ **Unsaved changes** — press Save Availability."
+                 if self.selected != self.saved_slots else "✅ All changes saved.")
+        return discord.Embed(
+            title="🗳️ Your D&D Availability", color=0x5865F2,
+            description=(
+                "**Step 1:** Select one or more **dates**.\n"
+                "**Step 2:** Select one or more **times**.\n"
+                "**Step 3:** Press **Add Times to Dates** to apply those times to *every* "
+                "chosen date. Repeat or remove times as needed.\n"
+                "**Step 4:** Press **Save Availability** once.\n\n"
+                f"**Dates to edit:** {chosen_dates}\n"
+                f"**Times to apply:** {chosen_times}\n"
+                f"**Draft:** {count} time slots across {dates} dates\n"
+                f"**Timezone:** `{self.timezone}`\n\n"
+                f"**Your availability:**\n{draft_summary}\n\n{saved}\n{note}"))
 
-    async def choose_day(self, interaction):
-        self.day = self.day_select.values[0]
-        self.redraw_times()
+    async def choose_days(self, interaction):
+        self.target_days = set(self.day_select.values)
+        self.redraw()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
     async def choose_times(self, interaction):
-        # A multi-select submits all selected options for this day at once.
-        self.selected = {slot for slot in self.selected if not slot.startswith(self.day)}
-        self.selected.update(f"{self.day}T{t}" for t in self.time_select.values)
-        self.redraw_times()
+        self.target_times = set(self.time_select.values)
+        self.redraw()
         await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def apply_times(self, interaction):
+        if not self.target_times:
+            return await interaction.response.edit_message(
+                embed=self.embed("ℹ️ Select one or more times before applying."), view=self)
+        chosen = {f"{day}T{time}" for day in self.target_days for time in self.target_times}
+        valid = chosen & self.slots
+        self.selected.update(valid)
+        self.redraw()
+        await interaction.response.edit_message(embed=self.embed(
+            f"✅ Added {len(valid)} valid date/time combinations to your draft."), view=self)
+
+    async def remove_times(self, interaction):
+        if not self.target_times:
+            return await interaction.response.edit_message(
+                embed=self.embed("ℹ️ Select one or more times to remove."), view=self)
+        chosen = {f"{day}T{time}" for day in self.target_days for time in self.target_times}
+        removed = len(self.selected & chosen)
+        self.selected.difference_update(chosen)
+        self.redraw()
+        await interaction.response.edit_message(embed=self.embed(
+            f"🗑️ Removed {removed} date/time combinations from your draft."), view=self)
 
     async def select_all(self, interaction):
-        self.selected.update(s for s in self.slots if s.startswith(self.day))
-        self.redraw_times()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        self.target_times = set(self.times)
+        self.redraw()
+        await interaction.response.edit_message(embed=self.embed(
+            "✅ All available times selected. Press **Add Times to Dates** to apply them."), view=self)
 
-    async def clear_day(self, interaction):
-        self.selected = {slot for slot in self.selected if not slot.startswith(self.day)}
-        self.redraw_times()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+    async def clear_dates(self, interaction):
+        self.selected = {s for s in self.selected if s[:10] not in self.target_days}
+        self.redraw()
+        await interaction.response.edit_message(embed=self.embed(
+            "🗑️ Cleared all availability for your selected dates (not saved yet)."), view=self)
 
     async def copy_previous(self, interaction):
-        # Copies weekday/time patterns, not exact old dates. Draft only: never auto-saves.
+        # Copies weekday/time patterns, not exact dates. Draft only: never auto-saves.
         old = await self.bot.store.previous_user_votes(self.guild_id, self.cycle, self.user_id)
         if not old:
-            await interaction.response.edit_message(
-                embed=self.embed("ℹ️ No availability from the immediately previous poll to copy."), view=self)
-            return
-        prior_patterns = {(datetime.fromisoformat(v["slot"][:10]).weekday(), v["slot"][11:]) for v in old}
-        new = {slot for slot in self.slots if
-               (datetime.fromisoformat(slot[:10]).weekday(), slot[11:]) in prior_patterns}
-        if not new:
             return await interaction.response.edit_message(embed=self.embed(
-                "ℹ️ Your previous poll has no matching weekdays/times in this poll. "
-                "Your current selections were left unchanged."), view=self)
-        self.selected = new
-        self.redraw_times()
+                "ℹ️ No previous poll preferences found."), view=self)
+        patterns = {(datetime.fromisoformat(v["slot"][:10]).weekday(), v["slot"][11:])
+                    for v in old}
+        matches = {s for s in self.slots if
+                   (datetime.fromisoformat(s[:10]).weekday(), s[11:]) in patterns}
+        if not matches:
+            return await interaction.response.edit_message(embed=self.embed(
+                "ℹ️ No matching weekdays/times in this poll. Your draft is unchanged."), view=self)
+        self.selected.update(matches)
+        self.redraw()
         await interaction.response.edit_message(embed=self.embed(
-            "🔁 Copied matching weekdays/times from your previous poll. "
-            "This applies to *every* matching upcoming date; please review and save."), view=self)
+            "🔁 Added matching weekday/time preferences from the preceding poll to your draft. "
+            "Review the selected dates and save."), view=self)
 
     async def save(self, interaction):
         if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("This availability form belongs to someone else.", ephemeral=True)
-        # Save the whole form only after validating this cycle is still open.
+            return await interaction.response.send_message(
+                "This availability form belongs to someone else.", ephemeral=True)
         async with self.bot.lock_for(self.guild_id):
             record = await self.bot.store.get(self.guild_id)
             if not record or record["state"] != "poll" or record["cycle"] != self.cycle or utcnow() >= dtread(record["poll_deadline"]):
-                return await interaction.response.send_message("This poll has closed; your unsaved changes were not recorded.", ephemeral=True)
+                return await interaction.response.send_message(
+                    "This poll has closed; your unsaved changes were not recorded.", ephemeral=True)
             if not self.selected <= set(self.bot.slots_for(record)):
-                return await interaction.response.send_message("Some selected times are no longer valid. Reopen the poll and try again.", ephemeral=True)
-            await self.bot.store.replace_user_votes(self.guild_id, self.cycle, self.user_id, self.selected)
+                return await interaction.response.send_message(
+                    "Some selected times are no longer valid. Reopen the poll.", ephemeral=True)
+            await self.bot.store.replace_user_votes(self.guild_id, self.cycle,
+                                                    self.user_id, self.selected)
         self.saved_slots = set(self.selected)
-        self.redraw_times()
-        total = len(self.saved_slots)
-        days = len({slot[:10] for slot in self.saved_slots})
+        self.redraw()
+        count = len(self.saved_slots)
+        days = len({s[:10] for s in self.saved_slots})
         await interaction.response.edit_message(embed=self.embed(
-            f"✅ Saved! You selected **{total}** time slot(s) across **{days}** date(s)."), view=self)
+            f"✅ Saved! **{count}** time slots across **{days}** dates."), view=self)
         await self.bot.refresh_poll(self.guild_id)
 
 
@@ -630,6 +676,14 @@ class SchedulerBot(commands.Bot):
         deadline = now + (timedelta(minutes=1) if is_test(config) else timedelta(days=config["poll_duration"]))
         await self.store.put(guild.id, config, cycle, "poll_preparing",
                              poll_deadline=deadline.isoformat(), poll_channel_id=config["channel_id"])
+        # Future dates already voted on in the previous cycle remain valid. Transfer
+        # exact matching slots only, preserving voter identity and RSVP priority.
+        if cycle > 1 and not is_test(config):
+            record = await self.store.get(guild.id)
+            copied = await self.store.carry_forward_votes(
+                guild.id, cycle - 1, cycle, self.slots_for(record))
+            if copied:
+                log.info("Carried %s overlapping availability votes into cycle %s", copied, cycle)
 
     async def publish_poll(self, guild, record):
         if record["state"] != "poll_preparing": return
@@ -638,9 +692,16 @@ class SchedulerBot(commands.Bot):
             raise ValueError("Scheduling text channel is missing")
         if not self.slots_for(record):
             raise ValueError("No slots remain after the poll closes; adjust days/times/weeks.")
+        # Recover vote carry-over if an earlier process stopped after the new
+        # cycle was written but before the transfer finished.
+        if record["cycle"] > 1 and not is_test(record["config"]):
+            await self.store.carry_forward_votes(
+                guild.id, record["cycle"] - 1, record["cycle"], self.slots_for(record))
         view = PollMessageView(self, guild.id, record["cycle"])
         message = await channel.send(content=mention(record["config"], guild),
-                         embed=build_poll_embed(record, []), view=view)
+                         embed=build_poll_embed(record,
+                                                await self.store.votes(guild.id, record["cycle"])),
+                         view=view)
         await self.store.update(guild.id, state="poll", poll_message_id=message.id)
         log.info("Published poll guild=%s cycle=%s", guild.id, record["cycle"])
 
@@ -657,7 +718,8 @@ class SchedulerBot(commands.Bot):
     async def close_poll(self, guild, record):
         votes = await self.store.votes(guild.id, record["cycle"])
         slots = [s for s in self.slots_for(record) if event_datetimes(s, record["config"])[0] > utcnow() + timedelta(minutes=5)]
-        chosen, users = choose_slot(votes, slots, record["config"]["dm_id"])
+        chosen, users = choose_slot(votes, slots, record["config"]["dm_id"],
+                                    attendee_limit=record["config"]["attendee_limit"])
         if record["poll_message_id"]:
             try:
                 channel = self.get_channel(record["poll_channel_id"]) or await self.fetch_channel(record["poll_channel_id"])
@@ -842,7 +904,7 @@ def build_scheduler_status(record, votes, rsvps):
     if not record:
         return discord.Embed(title="🛠️ Scheduler Status — Idle",
             description="No scheduler is configured. Use `/start_scheduler` for the campaign "
-                        "or `/once_scheduler` for a one-minute smoke test.", color=0x95A5A6)
+                        "or `/test_scheduler` for a one-minute smoke test.", color=0x95A5A6)
     c = record["config"]
     phase = record["state"]
     status = {
@@ -915,7 +977,7 @@ async def scheduler_status(interaction: discord.Interaction):
 async def start_scheduler(interaction: discord.Interaction, title: str = "Title",
     description: str = "Description for event", dm: discord.Member | None = None,
     weeks: int = 2, days: str = "thur,fri,sat,sun", times: str = "2pm,4pm,6pm",
-    poll_duration: int = 3, attendee_limit: int = 12,
+    poll_duration: int = 3, attendee_limit: int = 8,
     poll_after_event: int = 3, reminder_before_event: int = 6,
     ping_role: discord.Role | None = None, event_duration: int = 4):
     if not await admin_gate(interaction): return
@@ -965,9 +1027,9 @@ async def end_scheduler(interaction: discord.Interaction):
     await interaction.followup.send("🛑 Scheduler ended. Active bot poll/RSVP posts and future bot-created Discord events were cleared.", ephemeral=True)
 
 
-@bot.tree.command(name="once_scheduler", description="Run a one-minute test poll followed by a one-minute test event")
+@bot.tree.command(name="test_scheduler", description="Run a one-minute test poll followed by a one-minute test event")
 @app_commands.guild_only()
-async def once_scheduler(interaction: discord.Interaction):
+async def test_scheduler(interaction: discord.Interaction):
     if not await admin_gate(interaction): return
     await interaction.response.defer(ephemeral=True)
     try:

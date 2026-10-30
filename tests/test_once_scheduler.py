@@ -51,6 +51,8 @@ class Store:
         return []
     async def put(self, guild_id, cfg, cycle, state, **kwargs):
         self.writes.append((state, kwargs))
+    async def carry_forward_votes(self, guild_id, source_cycle, target_cycle, allowed):
+        return 0
     async def set_initial_rsvps(self, guild_id, cycle, users, limit):
         self.rsvps = list(users)
     async def update(self, guild_id, **kwargs):
@@ -76,10 +78,11 @@ class OnceTests(unittest.TestCase):
 
     def test_prepare_poll_is_one_minute_for_test_and_days_for_regular(self):
         (prepare,) = funcs('prepare_poll', methods=True, utcnow=lambda: NOW,
-                          timedelta=timedelta, is_test=lambda c: c.get('test_mode', False))
+                          timedelta=timedelta, is_test=lambda c: c.get('test_mode', False),
+                          log=SimpleNamespace(info=lambda *args: None))
         async def check():
             store = Store()
-            bot = SimpleNamespace(store=store)
+            bot = SimpleNamespace(store=store, slots_for=lambda record: [])
             guild = SimpleNamespace(id=55)
             cfg = {'test_mode': True, 'poll_duration': 3, 'channel_id': 9}
             await prepare(bot, guild, cfg, 1)
@@ -140,7 +143,7 @@ class OnceTests(unittest.TestCase):
     def test_test_command_does_not_ping_or_loop_and_saves_normal_config(self):
         # The command is a top-level coroutine: our loader removes its Discord decorators.
         async def gate(interaction): return True
-        (once,) = funcs('once_scheduler', admin_gate=gate,
+        (once,) = funcs('test_scheduler', admin_gate=gate,
                         config_defaults=lambda guild, user, ch: {'title': 'Original', 'days': [4], 'times': ['16:00'], 'poll_duration': 3},
                         is_test=lambda c: c.get('test_mode', False),
                         ValueError=ValueError, discord=SimpleNamespace(HTTPException=Exception, Interaction=object))

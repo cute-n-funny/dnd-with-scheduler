@@ -70,11 +70,14 @@ def slot_keys(config: dict, now: datetime, poll_end: datetime) -> list[str]:
     return result
 
 
-def choose_slot(votes: list[dict], valid_slots: list[str], dm_id: int, rng=None) -> tuple[str | None, list[int]]:
-    """Pick day by unique-user count, constraining to DM-voted dates if possible.
+def choose_slot(votes: list[dict], valid_slots: list[str], dm_id: int, rng=None,
+                attendee_limit: int = 8) -> tuple[str | None, list[int]]:
+    """Earliest qualified slot wins if it has >= attendee_limit distinct voters.
 
-    Within the selected day, pick the most popular *time* (random tie).
-    Returns selected slot and voter IDs for that slot in first-vote order.
+    DM-voted days remain a constraint. With no qualified slot, use the original
+    popular-day, then popular-time method (random tie-breaks). A person voting
+    for multiple times on one date is counted only once for the day tally.
+    Returns exact-slot voters in earliest-vote order for automatic RSVPs.
     """
     rng = rng or random
     valid = set(valid_slots)
@@ -88,11 +91,21 @@ def choose_slot(votes: list[dict], valid_slots: list[str], dm_id: int, rng=None)
         slot_voters[vote["slot"]].add(vote["user_id"])
     dm_days = {vote["slot"][:10] for vote in filtered if vote["user_id"] == dm_id}
     eligible_days = dm_days if dm_days else set(day_voters)
-    best_day_count = max(len(day_voters[day]) for day in eligible_days)
-    chosen_day = rng.choice(sorted(day for day in eligible_days if len(day_voters[day]) == best_day_count))
-    available_slots = [slot for slot in slot_voters if slot.startswith(chosen_day)]
-    best_slot_count = max(len(slot_voters[slot]) for slot in available_slots)
-    selected = rng.choice(sorted(slot for slot in available_slots if len(slot_voters[slot]) == best_slot_count))
+    qualified = sorted(slot for slot, users in slot_voters.items()
+                       if slot[:10] in eligible_days and len(users) >= attendee_limit)
+    if qualified:
+        # ISO wall-clock keys sort chronologically within this calendar/timezone.
+        # The soonest qualifying session wins, even when a later slot has more votes.
+        selected = qualified[0]
+    else:
+        # Not enough players at any one time: keep the existing popularity fallback.
+        best_day_count = max(len(day_voters[day]) for day in eligible_days)
+        chosen_day = rng.choice(sorted(day for day in eligible_days
+                                      if len(day_voters[day]) == best_day_count))
+        available_slots = [slot for slot in slot_voters if slot.startswith(chosen_day)]
+        best_slot_count = max(len(slot_voters[slot]) for slot in available_slots)
+        selected = rng.choice(sorted(slot for slot in available_slots
+                                     if len(slot_voters[slot]) == best_slot_count))
     first_vote_by_user = {}
     for vote in filtered:
         if vote["slot"] == selected:

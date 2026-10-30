@@ -96,6 +96,32 @@ class Store:
                             (guild_id, cycle, user_id, slot, datetime.now(timezone.utc).isoformat()))
             return True
 
+    async def carry_forward_votes(self, guild_id, source_cycle, target_cycle, valid_slots):
+        """Keep exact future availability, once per user/slot, across recurring polls.
+
+        INSERT OR IGNORE makes restarts/retries idempotent; it cannot overwrite
+        votes a player intentionally changed in the new poll. Copies timestamps.
+        """
+        valid_slots = sorted(set(valid_slots))
+        if not valid_slots or source_cycle >= target_cycle:
+            return 0
+        placeholders = ",".join("?" for _ in valid_slots)
+        async with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                before = self.db.total_changes
+                self.db.execute(
+                    "INSERT OR IGNORE INTO votes (guild_id,cycle,user_id,slot,created_at) "
+                    "SELECT guild_id,?,user_id,slot,created_at FROM votes "
+                    f"WHERE guild_id=? AND cycle=? AND slot IN ({placeholders})",
+                    (target_cycle, guild_id, source_cycle, *valid_slots))
+                copied = self.db.total_changes - before
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+        return copied
+
     async def set_initial_rsvps(self, guild_id, cycle, users, limit):
         async with self.lock:
             self.db.execute("DELETE FROM rsvps WHERE guild_id=? AND cycle=?", (guild_id, cycle))

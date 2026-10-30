@@ -86,6 +86,8 @@ Set `GUILD_ID` to your Discord server ID while testing to make slash commands ap
 
 ## Put it on GitHub
 
+Open PowerShell, run `winget search --id Microsoft.PowerShell` & `winget install --id Git.Git -e --source winget`.
+
 Create an empty repository named `dnd-with-scheduler`, then in the unpacked project directory:
 
 ```bash
@@ -100,8 +102,6 @@ git push -u origin main
 The `.gitignore` excludes tokens, `.env`, and SQLite files. GitHub Actions automatically runs unit tests and syntax checks on push and pull requests.
 
 ## Deploy 24/7 to Fly.io
-
-Open PowerShell, run `winget search --id Microsoft.PowerShell`.
 
 Install the [Fly CLI](https://fly.io/docs/flyctl/install/), log in (`fly auth login`), and create a Fly app. **Fly.io hosting and persistent volumes can incur charges**; an always-on Machine is not a free sleeping web app.
 

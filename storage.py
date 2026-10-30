@@ -156,3 +156,42 @@ class Store:
                 "UPDATE service_status SET is_running=0,updated_at=? WHERE guild_id=?",
                 (datetime.now(timezone.utc).isoformat(), guild_id)
             )
+
+    async def user_votes(self, guild_id, cycle, user_id):
+        """Only this user's saved slots for the current poll."""
+        async with self.lock:
+            return [dict(r) for r in self.db.execute(
+                "SELECT slot, created_at FROM votes WHERE guild_id=? AND cycle=? AND user_id=? "
+                "ORDER BY slot", (guild_id, cycle, user_id))]
+
+    async def previous_user_votes(self, guild_id, cycle, user_id):
+        """Slots from the immediately preceding poll, if any."""
+        async with self.lock:
+            return [dict(r) for r in self.db.execute(
+                "SELECT slot, created_at FROM votes WHERE guild_id=? AND cycle=? AND user_id=? "
+                "ORDER BY slot", (guild_id, cycle - 1, user_id))]
+
+    async def replace_user_votes(self, guild_id, cycle, user_id, slots):
+        """Save the complete availability form atomically, preserving original vote order.
+
+        Keeping timestamps for unchanged slots is important for first-come RSVP
+        priority, while the DB lock and explicit transaction prevent half-saved days.
+        """
+        slots = sorted(set(slots))
+        now = datetime.now(timezone.utc).isoformat()
+        async with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                current = {r[0]: r[1] for r in self.db.execute(
+                    "SELECT slot, created_at FROM votes WHERE guild_id=? AND cycle=? AND user_id=?",
+                    (guild_id, cycle, user_id))}
+                self.db.execute(
+                    "DELETE FROM votes WHERE guild_id=? AND cycle=? AND user_id=?",
+                    (guild_id, cycle, user_id))
+                self.db.executemany(
+                    "INSERT INTO votes (guild_id,cycle,user_id,slot,created_at) VALUES (?,?,?,?,?)",
+                    [(guild_id, cycle, user_id, slot, current.get(slot, now)) for slot in slots])
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise

@@ -1,20 +1,32 @@
-# Replace app name with an available Fly.io app name before deployment.
-app = "your-unique-dnd-scheduler"
-primary_region = "ord"
+# fly.toml app configuration file generated for dnd-with-scheduler on 2026-10-30T19:13:45Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'dnd-with-scheduler'
+primary_region = 'ord'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  TZ_NAME = "America/Chicago"
-  DATABASE_PATH = "/data/scheduler.db"
+  DATABASE_PATH = '/data/scheduler.db'
+  TZ_NAME = 'America/Chicago'
 
 [[mounts]]
-  source = "scheduler_data"
-  destination = "/data"
+  source = 'scheduler_data'
+  destination = '/data'
 
-# No HTTP service. A single persistent Gateway bot process runs continuously.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
 [[vm]]
-  memory = "512mb"
-  cpu_kind = "shared"
+  memory = '512mb'
+  cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 512

@@ -101,6 +101,8 @@ The `.gitignore` excludes tokens, `.env`, and SQLite files. GitHub Actions autom
 
 ## Deploy 24/7 to Fly.io
 
+Open PowerShell, run `winget search --id Microsoft.PowerShell`.
+
 Install the [Fly CLI](https://fly.io/docs/flyctl/install/), log in (`fly auth login`), and create a Fly app. **Fly.io hosting and persistent volumes can incur charges**; an always-on Machine is not a free sleeping web app.
 
 1. In `fly.toml`, replace `your-unique-dnd-scheduler` with an available globally unique Fly app name. Change `primary_region = "ord"` if needed; keep the volume in the same region.

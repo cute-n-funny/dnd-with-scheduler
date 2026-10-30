@@ -1,172 +1,157 @@
-# 🎲 D&D with Scheduler
+# D&D with Scheduler
 
-A Discord bot that continuously schedules D&D sessions using DM-prioritized availability polls, capped bot-managed RSVPs, native Discord Scheduled Events, forum posts, reminders, and calendar exports.
+A persistent Discord bot for polling player availability, choosing a D&D session slot, creating a native Discord Scheduled Event plus forum post, managing limited RSVPs/waitlists, sending reminders, and repeating the cycle. Built with `discord.py 2.7.1`, Python 3.12, SQLite, and Fly.io.
 
-Designed for **Python 3.12 + discord.py 2.7.1**, a **single Railway worker**, and **SQLite on a persistent Railway volume**.
+**Deployment status:** Source code only. It is not automatically uploaded to your GitHub account or deployed to Fly.io. Follow the steps below with your own Discord bot token and Fly account.
 
-> **Status:** The scheduling logic and SQLite RSVP tests pass locally. The bot integration has not been tested against a live Discord server. Review permissions, run a full test cycle in a test server, and check Railway logs before relying on it.
+## What it does
 
-## How it works
+1. `/start_scheduler` posts an availability grid in the scheduling channel and pings a role.
+2. Players click **Vote / Edit Availability**, then choose a date and time in a private interactive menu. Repeat to vote for more slots. Clicking again removes an existing vote. The public grid updates per-slot counts.
+3. After `poll_duration` days, the bot counts **distinct voters per calendar day**; if the DM voted, only dates the DM selected are eligible. The top day wins (random tie). Within that day, the most popular time wins (random tie).
+4. If nobody voted for a still-valid slot, a new availability poll is posted with the same configuration.
+5. The bot creates a **native Discord Scheduled Event** (in `voice-chat`/`VC` if found; otherwise an external-location event), creates a post in the `dnd-session-events` **forum** channel, and posts an RSVP announcement in the scheduling channel, pinging the role again.
+6. Users who voted for **the winning date-and-time slot** are auto-added to the bot's RSVP list in the order they first voted for that slot. The first `attendee_limit` are confirmed, the rest waitlisted. Anyone else can join the bot RSVP list using **Join / Leave RSVP**. A confirmed cancellation promotes the earliest waitlisted person.
+7. The bot attempts to **start and complete the native Discord event automatically** at the scheduled times.
+8. The RSVP message includes **Add to Google Calendar**, **Download iCal (.ics)**, and a link to the native Discord Scheduled Event. Users who want native Discord *Interested* notifications must click that themselves.
+9. A reminder pings the role `reminder_before_event` hours before **session start**. After the session ends, a new poll opens `poll_after_event` hours later, unless the schedule was created with `/once_scheduler`.
 
-1. An Admin or member with Manage Server permission runs `/start_scheduler` in Discord. It posts in `#scheduling-&-voting` (or in the command channel if that name does not exist).
-2. The bot pings a role or `@everyone`, displaying an interactive **date X-axis / time Y-axis voting matrix**. Discord permits only five component rows, so each page displays at most 4 dates × 4 times. **Dates ▶ / Times ▶** open a *private* next page for that voter; they do not change the public page. Each user may vote for multiple date/time cells; clicking the same cell again cancels that vote.
-3. After 3–7 days, the poll closes. If the DM voted, only slots the DM selected are eligible; the most-voted of those wins. Otherwise, the most-voted overall slot wins. Ties are broken randomly. If no eligible votes remain, the bot starts a new poll automatically.
-4. The bot creates a native Discord Scheduled Event associated with your voice channel named `VC` (or an external event if that channel doesn't exist), posts an announcement with RSVP buttons, and creates a new thread in the `dnd-session-events` forum.
-5. Players who voted for the **winning date/time cell** are auto-confirmed in first-vote order up to the attendee limit. Remaining voters for that cell are waitlisted. Other players may RSVP through the bot's button; cancellations automatically promote the oldest waitlisted member.
-6. The event announcement has `RSVP / Cancel`, `Download iCal`, `Add to Google Calendar`, and `Discord event (Interested)` buttons. The bot sends the configured reminder *before the event starts*.
-7. When the event ends, the bot starts a new poll after the specified post-event delay, unless `/once_scheduler` was used.
+## Discord setup
 
-### Discord's native RSVP limitation
+Create a bot application at the [Discord Developer Portal](https://discord.com/developers/applications). Under **Bot**, create/reset the token, then store it as a Fly secret; **never commit it to GitHub**.
 
-**Discord does not expose a bot API to subscribe someone to a Guild Scheduled Event as "Interested".** Auto-RSVP and attendee-limit enforcement are therefore **inside the bot**, not native Discord. People can separately click **Interested** on Discord's event. The bot does not count or cap native Interested participants, which might differ from bot RSVP totals.
+Under OAuth2 / Installation, invite the bot with the `bot` and `applications.commands` scopes. Grant permissions:
 
-The event announcement is an interactive bot RSVP post; the native Scheduled Event itself cannot be made into a custom bot-controlled RSVP poll. This design provides both surfaces without claiming they are synchronized.
+- View Channels, Send Messages, Read Message History, Embed Links, Attach Files
+- Create Events and Manage Events
+- Send Messages in Threads; permission to post in the `dnd-session-events` Forum channel
+- Mention @everyone, @here, and All Roles **if** using the default `@everyone` ping (or role ping permissions)
 
-### Decisions about ambiguous requirements
+The bot uses default gateway intents, so it **does not require Message Content** or **Server Members** privileged intents.
 
-- **A vote is for a date + time cell**, not merely a weekday. Winning slots are selected using DM priority as described above.
-- **Only members who voted for the winning slot** are automatically RSVP'd; voting for a losing slot does not mean you committed to a time you cannot attend.
-- `reminder-before-event` means hours **before the upcoming event starts**. Your specification's phrase about creating a new poll before the previous event ends appears to be a copy/paste error. `poll-after-event` controls the next poll.
-- Day windows start **seven days from the local date the poll opens**, then include the next `weeks × 7` days. Each poll is recalculated from its own start time.
-- Bot event cancellations are limited to tracked events created by this bot in the server. The bot never removes unrelated members' events. `/reset_scheduler`, `/end_scheduler`, and `/once_scheduler` remove tracked poll/event announcement posts, delete tracked Scheduled Events that have not finished, and archive/lock old session threads, preserving discussion history instead of deleting it.
-- **One scheduler per Discord server** and **one Railway bot replica**. Multiple instances connected to the same token/SQLite file are not supported.
-- Timezone is configured with the service-wide `TIMEZONE` variable (default `America/Chicago`).
+Your server should have:
 
-## Discord server structure
+| Channel | Type | Purpose |
+| --- | --- | --- |
+| `⚠️scheduling-&-voting⚠️` (or any name containing `scheduling`) | Text | Polls, RSVP announcements, reminders |
+| `dnd-session-events` | **Forum** | One forum thread/post for each scheduled session |
+| `voice-chat` or `VC` | Voice (optional) | Native Scheduled Event's channel |
 
-```text
-D&D with Scheduler
-├─ ⚠️scheduling-&-voting⚠️  (Text channel: set the *actual* Discord name in POLL_CHANNEL_NAME)
-├─ Read This
-│  ├─ signup-instructions
-│  ├─ homebrew-rules-(do_later)
-│  ├─ character-creation-(do_later)
-│  └─ roles
-├─ Chatting
-│  ├─ general-yapping
-│  ├─ dnd-session-events    (FORUM channel, not text)
-│  └─ characters-&-lore-wiki (Forum channel)
-└─ Voice Chat
-   ├─ voice-chat
-   └─ VC                    (VOICE channel)
-```
+If Discord names your channels differently, set `SCHEDULING_CHANNEL_ID` and `FORUM_CHANNEL_ID` as environment variables or Fly secrets. To find an ID, enable Discord Developer Mode and **Copy Channel ID**.
 
-Discord channel category labels (for example `Chatting`) do not affect the bot. Only **actual channel names** matter, and you can override them with environment variables. The `Admin` role name must match exactly, or members may use Manage Server permission. You do **not** need to enable privileged Message Content or Members intents just for slash commands.
+Only members with Administrator, Manage Server, or a role literally named `Admin` are allowed to execute the four slash commands. Every guild has at most one active scheduler; running the start, reset, or once command replaces it.
 
-## Commands
+## Slash commands
 
-All commands require the `Admin` role or Discord's **Manage Server** permission.
+Discord slash option names use underscores (`poll_duration`) rather than the hyphens shown in your initial spec (`poll-duration`).
 
-| Slash command | Description |
-| --- | --- |
-| `/start_scheduler` | Clears and replaces the guild's current schedule, using new arguments. Continues in a loop. |
-| `/reset_scheduler` | Clears old bot polls/events and starts a new **recurring** poll with the last saved settings, or defaults if none. |
-| `/end_scheduler` | Stops the loop and clears tracked bot polls/event posts and scheduled events. |
-| `/once_scheduler` | Clears old tracked items and schedules **one** event using saved settings, or defaults if none. |
+| Command or option | Default | Behavior |
+| --- | --- | --- |
+| `/start_scheduler` | — | New recurring schedule; clears previous bot schedule and future bot-created native events |
+| `title` | `Title` | Title of poll and session (max 100 chars) |
+| `description` | `Description for event` | Poll and event description (max 900 chars) |
+| `dm` | Command author | Member who constrains eligible **days** when they vote |
+| `weeks` | `2` | 1–4 seven-day blocks, starting **seven calendar days** after the poll is created |
+| `days` | `thur,fri,sat,sun` | 1–4 comma-separated weekdays |
+| `times` | `2pm,4pm,6pm` | 1–12 comma-separated local times, also accepts `4:15pm` or `18:30` |
+| `poll_duration` | `3` | Poll duration in days, 3–7 |
+| `attendee_limit` | `12` | Maximum confirmed bot-managed RSVP spots, 1–99 |
+| `poll_after_event` | `3` | Hours after an event ENDS before new poll, 3–24 |
+| `reminder_before_event` | `6` | Hours before an event STARTS to send a reminder, 3–24 |
+| `ping_role` | `@everyone` | Ping on each poll, event and reminder |
+| `event_duration` | `4` | Event hours, 1–24 |
+| `/reset_scheduler` | — | Clear active posts/events and start a recurring poll using saved settings, or defaults |
+| `/end_scheduler` | — | Clear active posts/events and stop the loop |
+| `/once_scheduler` | — | Clear active posts/events, poll once and schedule exactly one event (saved settings, or defaults) |
 
-`/start_scheduler` options (all optional):
+Example: `/start_scheduler title:Dragon of Icespire Peak days:fri,sat times:4pm,6:30pm weeks:2 poll_duration:3 attendee_limit:6`
 
-| Option | Type | Default | Limits / Meaning |
-| --- | --- | --- | --- |
-| `title` | String | `Title` | 1–100 characters |
-| `description` | String | `Description for event` | 1–1000 characters |
-| `dm` | Discord member | Command creator | DM-prioritized slot votes |
-| `weeks` | Integer | `2` | 1–4 |
-| `days` | String | `thur,fri,sat,sun` | Weekday comma list (also supports `thu`) |
-| `times` | String | `2pm,4pm,6pm` | Comma list; also accepts `4:15pm`, `14:00` |
-| `poll-duration` | Integer | `3` | 3–7 days |
-| `attendee-limit` | Integer | `12` | 1–100 confirmed guests |
-| `poll-after-event` | Integer | `3` | 3–24 hours after event ends |
-| `reminder-before-event` | Integer | `6` | 3–24 hours before event starts |
-| `ping-role` | Role | `@everyone` | Must allow the bot to mention the target role, or be mentionable |
-| `event-duration` | Integer | `4` | 1–24 hours |
+**Voting behavior choices:** Your original description says the *day* with the most votes wins, while also asking for times. This implementation picks the winning **day** using unique voters, then the winning **time** within that day. Auto-RSVPs are limited to people who voted for that exact winning slot rather than people available only at some other time. The DM's vote determines eligible days, not necessarily times. This is easy to change in `logic.choose_slot` if your group wants another rule.
 
-Example:
-
-```text
-/start_scheduler title:"Curse of Strahd" description:"Session zero" weeks:2 days:"thur,fri,sat,sun" times:"2pm,4:15pm,6:30pm" poll-duration:3 attendee-limit:6 poll-after-event:3 reminder-before-event:6 event-duration:4
-```
-
-The exact syntax for slash command values is controlled by Discord's command UI; select role/member fields with Discord's picker.
-
-## Create your Discord bot
-
-1. Visit [Discord Developer Portal](https://discord.com/developers/applications), create an application called **D&D with Scheduler**, and open **Bot** to create/reset the bot token.
-2. Under **OAuth2 → URL Generator**, select scopes `bot` and `applications.commands` (or use the Installation tab with Guild Install enabled).
-3. Give the bot the necessary permissions: **View Channels, Send Messages, Embed Links, Attach Files, Read Message History, Manage Events, Create Public Threads/Send Messages in Threads, Manage Threads**. **Mention @everyone, @here, and All Roles** is needed to reliably ping `@everyone` or non-mentionable roles. The ability to create posts in the forum channel must also be allowed.
-4. Invite the bot to your server. The `Admin` role is checked on members running commands, not required for the bot itself.
-5. Create the text channel, **Forum** channel and VC voice channel matching your configured names. Run commands in your server, not in direct messages.
-
-**Never commit the bot token to GitHub.** Set it as `DISCORD_TOKEN` in Railway's Variables settings.
+**Timezone:** The bot uses `TZ_NAME=America/Chicago` by default. Change it to an [IANA timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) appropriate to your server **before starting**. Discord timestamps display in each viewer's local timezone, while the voting grid uses the configured server timezone. A nonexistent DST time is excluded; an ambiguous fall-back time uses the first occurrence.
 
 ## Run locally
 
-Requirements: Python 3.12 and pip.
-
 ```bash
 python -m venv .venv
-# On Linux/macOS:
-source .venv/bin/activate
-# On Windows: .venv\Scripts\activate
+source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 cp .env.example .env
-```
-
-Edit `.env`: set `DISCORD_TOKEN`, optionally `DISCORD_GUILD_ID` for fast command registration in one test server, `TIMEZONE`, and **change `DB_PATH=./scheduler.sqlite3` locally** if you do not have `/data`.
-
-```bash
+# Edit .env, then export its variables. This app does not automatically read .env.
+set -a; source .env; set +a   # macOS/Linux
 python bot.py
 ```
 
-Commands will sync to `DISCORD_GUILD_ID` when set, otherwise globally. Global slash commands may take time to propagate.
+Set `GUILD_ID` to your Discord server ID while testing to make slash commands appear quickly. Without `GUILD_ID`, global commands are synchronized and may take longer to appear. Database file defaults to `./data/scheduler.db` for local runs.
 
-## Deploy to Railway using GitHub
+## Put it on GitHub
 
-1. Download/unzip this project and **create a GitHub repository** (for example `dnd-with-scheduler`). Push all files **except `.env`**, which is already gitignored.
-2. Open [Railway](https://railway.com), create a **New Project → Deploy from GitHub repo**, and select this repository. Railway will build the included `Dockerfile`.
-3. In your Railway service, add a **Volume mounted at `/data`**. SQLite is stored in `/data/scheduler.sqlite3` and survives redeploys. Without a volume, a new deployment can erase polls/RSVPs.
-4. In Railway **Variables**, set:
+Create an empty repository named `dnd-with-scheduler`, then in the unpacked project directory:
 
-   ```text
-   DISCORD_TOKEN=your_private_token
-   DB_PATH=/data/scheduler.sqlite3
-   TIMEZONE=America/Chicago
-   DISCORD_GUILD_ID=your_testing_server_id   # optional
-   POLL_CHANNEL_NAME=scheduling-&-voting
-   EVENTS_FORUM_NAME=dnd-session-events
-   VOICE_CHANNEL_NAME=VC
-   ```
+```bash
+git init
+git add .
+git commit -m "Initial D&D scheduling bot"
+git branch -M main
+git remote add origin https://github.com/YOUR_USERNAME/dnd-with-scheduler.git
+git push -u origin main
+```
 
-5. Deploy. This is a **persistent background worker** using the Discord Gateway, not a public web service. You do not need a domain, public port, healthcheck HTTP endpoint, or Railway Cron Job.
-6. Leave **replicas at 1**. In your test server, run `/once_scheduler` and vote. For a faster test, temporarily edit time constraints in a development branch or test the pure scheduling functions locally; production `/start_scheduler` enforces the 3–7 day poll duration.
-7. Check the **Railway deployment logs** for permission errors. Pushes to GitHub can trigger automatic Railway redeploys.
+The `.gitignore` excludes tokens, `.env`, and SQLite files. GitHub Actions automatically runs unit tests and syntax checks on push and pull requests.
 
-More: [Railway services](https://docs.railway.com/services) · [Railway volumes](https://docs.railway.com/volumes) · [Discord Scheduled Events](https://support.discord.com/hc/en-us/articles/4409494125719-Scheduled-Events)
+## Deploy 24/7 to Fly.io
 
-## Persistence and production notes
+Install the [Fly CLI](https://fly.io/docs/flyctl/install/), log in (`fly auth login`), and create a Fly app. **Fly.io hosting and persistent volumes can incur charges**; an always-on Machine is not a free sleeping web app.
 
-- Votes, sessions, RSVP positions, and config persist in SQLite. Persistent Discord components are re-registered on startup. The scheduler checks due work approximately every 30 seconds, retries failures, and does not require a cron service.
-- The backend is intended to run only once. Don't scale it to several replicas; the database does not provide distributed locking.
-- The bot records event IDs and only manages events it created. Reset/stop archives session threads instead of deleting player discussion.
-- Partial Discord API failures are logged; the bot attempts basic recovery. A crash during the narrow window between Discord creating an event and saving its ID can still produce a duplicate; administrators should inspect the Events tab after a crash during event creation.
-- Calendar `.ics` files are generated on demand; Google Calendar buttons open a *pre-filled event*, which the user must save. Calendar exports don't synchronize future RSVP changes.
-- Native Discord Scheduled Events are separately visible to the guild; their **Interested** button is independent of the bot's cap and waitlist.
-- SQLite volume is persistent storage, not a backup. Back up the volume periodically.
-- Voice-channel native events are started and completed by the bot when due; if the bot is unavailable at start, those transitions are attempted on recovery.
+1. In `fly.toml`, replace `your-unique-dnd-scheduler` with an available globally unique Fly app name. Change `primary_region = "ord"` if needed; keep the volume in the same region.
+2. From the project directory, run the following commands, replacing the name:
+
+```bash
+fly auth login
+fly apps create YOUR_UNIQUE_APP_NAME
+fly volumes create scheduler_data --region ord --size 1 -a YOUR_UNIQUE_APP_NAME
+fly secrets set DISCORD_TOKEN=YOUR_SECRET_DISCORD_BOT_TOKEN GUILD_ID=YOUR_DISCORD_SERVER_ID -a YOUR_UNIQUE_APP_NAME
+fly deploy -a YOUR_UNIQUE_APP_NAME
+fly scale count 1 -a YOUR_UNIQUE_APP_NAME
+fly logs -a YOUR_UNIQUE_APP_NAME
+```
+
+`GUILD_ID` is recommended, not required. To override timezone or channel lookup, set additional secrets with `fly secrets set TZ_NAME=... SCHEDULING_CHANNEL_ID=... FORUM_CHANNEL_ID=... -a YOUR_UNIQUE_APP_NAME`.
+
+The `fly.toml` intentionally declares **no HTTP service**. This is a long-running Discord Gateway worker, so there is no web address or health-check route to ping, and no incoming traffic to wake the app. Keep **exactly one Machine** running: more than one copy of this gateway process on the same DB would cause duplicate timer actions and SQLite-volume problems. A 1 GB `scheduler_data` volume mounted at `/data` preserves the DB between deployments and restarts. Fly volumes are tied to their region/Machine and aren't automatically backed up: consider periodic volume snapshots/backups.
+
+When you change code and push to GitHub, deploy updated code from your local checkout with `fly deploy`. Alternatively, the included **Deploy to Fly.io** GitHub Actions workflow can deploy manually from GitHub's **Actions** tab. First create the Fly app and volume as above, then set the repo secret `FLY_API_TOKEN` (a scoped Fly deploy token). The workflow is intentionally *manual* (`workflow_dispatch`) so pushes do not unexpectedly deploy. **No production token is included** in this project.
 
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -v
+python -m compileall -q bot.py logic.py storage.py
 ```
 
-Tests cover day/time parsing, voting priority, week windows, RSVP/waitlist promotions and calendar exports. They do not simulate a live Discord API.
+## Reliability and limitations
 
-## Files
+- The bot stores scheduling state, votes, RSVP order, and reminder state in SQLite, and checks for due actions every 45 seconds. Restarts will resume the cycle. Network operations are retried on the next tick if they fail, but there is no guarantee of exactly-once message delivery if Discord accepts an operation immediately before a crash.
+- Native Discord *Interested* and bot-managed RSVP are **separate systems**. Discord does not let the bot sign other users up to native Scheduled Event subscriptions. The attendee limit applies to the **bot RSVP message**, not the native Discord Event's Interested counter.
+- The app is designed for one Fly Machine, not multiple replicas. The SQLite DB is not automatically replicated to other regions.
+- The bot uses the first matching `voice-chat`/`VC` voice channel if present. Without one, it makes an external-location Scheduled Event pointing people to the forum post.
+- Reset/end remove **current bot-created messages/posts and future native events created by this bot**. They do not delete unrelated server events or historic forum posts from earlier sessions.
+- If no votes remain valid at closing time (including if a restart lasts past proposed session times), a new poll starts.
+- The simple app uses no web dashboard, automatic Google account writing, manual organizer override, or external reminder service. The Google button opens the player's own calendar prefilled; the iCal button delivers a downloadable file.
+- System notices and scheduling depend on the Fly Machine staying healthy and your Discord/Fly permissions remaining valid. Use `fly logs` to investigate failures.
 
-- `bot.py` — Discord bot, slash commands, buttons, reminder/recurrence worker.
-- `scheduler_logic.py` — deterministic parsing, scheduling, voting, calendars.
-- `storage.py` — SQLite state and RSVP records.
-- `tests/test_scheduler.py` — unit tests for scheduling and data rules.
-- `Dockerfile` and `railway.json` — Railway build/deployment instructions.
-- `.env.example` — configuration template.
+## Project layout
+
+```text
+bot.py                 Discord slash commands, views, recurring worker
+logic.py               Date selection, tie-breaking, calendar links and .ics
+storage.py             Persistent SQLite schedule, votes, RSVPs
+Dockerfile             Python runtime for Fly.io
+fly.toml               One 24/7 Machine and persistent volume
+requirements.txt       Pinned dependency
+.env.example           Environment variable example
+.github/workflows/     Unit-test CI + optional manual Fly deployment
+ tests/                 Pure logic and storage tests
+```
+
+License: MIT.

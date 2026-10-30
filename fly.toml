@@ -1,0 +1,20 @@
+# Replace app name with an available Fly.io app name before deployment.
+app = "your-unique-dnd-scheduler"
+primary_region = "ord"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  TZ_NAME = "America/Chicago"
+  DATABASE_PATH = "/data/scheduler.db"
+
+[[mounts]]
+  source = "scheduler_data"
+  destination = "/data"
+
+# No HTTP service. A single persistent Gateway bot process runs continuously.
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

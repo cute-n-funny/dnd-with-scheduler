@@ -29,7 +29,7 @@ class Guild:
 
 
 def load_channel_router():
-    script = ast.parse((Path(__file__).resolve().parents[1] / 'bot.py').read_text())
+    script = ast.parse((Path(__file__).resolve().parents[1] / 'bot.py').read_text(encoding='utf-8'))
     cls = next(n for n in script.body if isinstance(n, ast.ClassDef) and n.name == 'SchedulerBot')
     selected = [n for n in cls.body if isinstance(n, ast.FunctionDef)
                 and n.name in {'scheduler_channel', 'text_channel'}]

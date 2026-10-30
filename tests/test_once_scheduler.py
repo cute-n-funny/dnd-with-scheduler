@@ -14,7 +14,7 @@ from logic import choose_slot
 
 NOW = datetime(2026, 10, 30, 21, 0, tzinfo=timezone.utc)
 SLOT = '2026-11-07T14:00'
-SOURCE = (Path(__file__).resolve().parents[1] / 'bot.py').read_text()
+SOURCE = (Path(__file__).resolve().parents[1] / 'bot.py').read_text(encoding='utf-8')
 TREE = ast.parse(SOURCE)
 
 

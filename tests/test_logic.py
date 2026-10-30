@@ -72,7 +72,12 @@ class SchedulingTests(unittest.TestCase):
             self.assertEqual({r["user_id"] for r in await store.rsvps(123,1)
                               if r["status"] == "confirmed"}, {10,30})
         with TemporaryDirectory() as folder:
-            asyncio.run(exercise(Store(str(Path(folder)/'scheduler.db'))))
+            store = Store(str(Path(folder) / 'scheduler.db'))
+            try:
+                asyncio.run(exercise(store))
+            finally:
+                # Windows will not delete an open SQLite database file.
+                store.db.close()
 
 if __name__ == '__main__':
     unittest.main()

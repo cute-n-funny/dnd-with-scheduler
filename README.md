@@ -33,13 +33,39 @@ Your server should have:
 
 | Channel | Type | Purpose |
 | --- | --- | --- |
-| `⚠️scheduling-&-voting⚠️` (or any name containing `scheduling`) | Text | Polls, RSVP announcements, reminders |
+| `scheduler` | **Private text** (only you + bot) | Slash commands, startup/shutdown notices |
+| `⚠️scheduling-&-voting⚠️` (or any name containing `scheduling`) | **Public text** | Polls, RSVP announcements, reminders |
 | `dnd-session-events` | **Forum** | One forum thread/post for each scheduled session |
 | `voice-chat` or `VC` | Voice (optional) | Native Scheduled Event's channel |
 
-If Discord names your channels differently, set `SCHEDULING_CHANNEL_ID` and `FORUM_CHANNEL_ID` as environment variables or Fly secrets. To find an ID, enable Discord Developer Mode and **Copy Channel ID**.
+If Discord names your channels differently, set `SCHEDULER_CHANNEL_ID` for private bot controls, `SCHEDULING_CHANNEL_ID` for public polls, and `FORUM_CHANNEL_ID` for the forum as environment variables or Fly secrets. To find an ID, enable Discord Developer Mode and **Copy Channel ID**.
 
 Only members with Administrator, Manage Server, or a role literally named `Admin` are allowed to execute the four slash commands. Every guild has at most one active scheduler; running the start, reset, or once command replaces it.
+
+## Private control channel and public voting channel
+
+Your server uses **two different text channels**:
+
+- **`#scheduler` is private** (visible only to the admin and the bot). All four slash commands (`/start_scheduler`, `/reset_scheduler`, `/end_scheduler`, `/once_scheduler`) **must be run here**. Startup/shutdown notices appear here only. Admin permissions are still required; running a slash command anywhere else is rejected with a private response.
+- **`#⚠️scheduling-&-voting⚠️` is public** (viewable by players). Availability polls, voting interactions, RSVP messages, and reminders are posted here. The bot also creates forum posts in `dnd-session-events` and Discord Scheduled Events as before.
+
+Use **separate** channel IDs (Discord Developer Mode → right click each channel → Copy Channel ID):
+
+```bash
+fly secrets set SCHEDULER_CHANNEL_ID=YOUR_PRIVATE_SCHEDULER_CHANNEL_ID SCHEDULING_CHANNEL_ID=YOUR_PUBLIC_VOTING_CHANNEL_ID -a dnd-with-scheduler
+```
+
+**Do not set `SCHEDULING_CHANNEL_ID` to the private `#scheduler` channel.** The bot refuses to route public polls there. If you leave the IDs unset, it looks for the exact name `scheduler` for commands and a public text channel whose name contains `scheduling` for polls. Providing both IDs is more reliable.
+
+Configure Discord's own **channel permissions** so players cannot view `#scheduler` and the bot can send messages in both channels. A bot command restriction alone does not make a channel private. Discord may still show slash commands in autocomplete in other channels; execution outside `#scheduler` is rejected.
+
+The updated `fly.toml` sets `kill_signal = "SIGTERM"` and `kill_timeout = 20` to give graceful shutdown notices more time.
+
+- On a successful bot start, it posts **Fly Services Have Started** in private `#scheduler` once per process start.
+- On a **graceful** shutdown (such as a deploy/restart), it attempts to post **Fly Services Have Shutdown** in private `#scheduler`.
+- On an abrupt crash, the offline bot cannot send a message; on its **next startup**, it reports the previous shutdown retrospectively, then sends **Fly Services Have Started**.
+
+**Important limitation:** An offline bot cannot post the instant it crashes or loses connectivity. To alert you while it remains offline, use an independent external monitor. These built-in messages are best-effort and the last known running/stopped state is saved in SQLite.
 
 ## Slash commands
 

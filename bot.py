@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import io
 import logging
 import os
+import signal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
@@ -32,7 +33,23 @@ def dtread(s):
     return datetime.fromisoformat(s) if s else None
 
 
+def is_test(config):
+    return config.get("test_mode", False)
+
+
+def event_title(config):
+    return "Test Event" if is_test(config) else config["title"]
+
+
+def poll_start(record):
+    end = dtread(record["poll_deadline"])
+    window = timedelta(minutes=1) if is_test(record["config"]) else timedelta(days=record["config"]["poll_duration"])
+    return end - window
+
+
 def mention(config, guild):
+    if is_test(config):
+        return ""  # The test poll and test event never ping @everyone or a role.
     role_id = config.get("ping_role_id")
     return f"<@&{role_id}>" if role_id and role_id != guild.id else "@everyone"
 
@@ -48,7 +65,7 @@ def config_defaults(guild, creator_id, channel_id):
                 weeks=2, days=[3, 4, 5, 6], times=["14:00", "16:00", "18:00"],
                 poll_duration=3, attendee_limit=12, poll_after_event=3,
                 reminder_before_event=6, ping_role_id=guild.id,
-                event_duration=4, timezone=TZ_NAME, channel_id=channel_id, looping=True)
+                event_duration=4, timezone=TZ_NAME, channel_id=None, looping=True)
 
 
 def validate_config(c):
@@ -74,19 +91,26 @@ def event_link(guild_id, event_id):
 def build_poll_embed(record, votes, *, closed=False, winner=None):
     c = record["config"]
     end = dtread(record["poll_deadline"])
-    slots = slot_keys(c, end - timedelta(days=c["poll_duration"]), end)
+    slots = slot_keys(c, poll_start(record), end)
     counts = Counter(v["slot"] for v in votes)
     members = len({v["user_id"] for v in votes})
     embed = discord.Embed(title=f"🗓️ {c['title']} — Availability", color=0x5865F2,
                           description=(f"{c['description']}\n\n"
+                          + ("**Test only:** this poll closes after one minute. A one-minute "
+                             "**Test Event** is scheduled one minute after closing, regardless "
+                             "of the winning date/time or whether anyone votes.\n\n" if is_test(c) else "") +
                           f"DM: <@{c['dm_id']}> | **{members}** players voted | Timezone: `{c['timezone']}`\n"
                           f"{'**Poll closed**' if closed else f'Closes <t:{int(end.timestamp())}:R>'}\n"
                           "Choose **Vote / Edit Availability** to add/remove as many slots as you can attend."))
     if winner:
-        start, _ = event_datetimes(winner, c)
-        embed.add_field(name="Selected date/time", value=f"<t:{int(start.timestamp())}:F>", inline=False)
+        if is_test(c):
+            embed.add_field(name="Winning test availability slot (not event time)",
+                            value=winner.replace("T", " at "), inline=False)
+        else:
+            start, _ = event_datetimes(winner, c)
+            embed.add_field(name="Selected date/time", value=f"<t:{int(start.timestamp())}:F>", inline=False)
     # Four independent 7-day windows, each with at most four date columns.
-    anchor = (end - timedelta(days=c["poll_duration"])).astimezone(ZoneInfo(c["timezone"])).date() + timedelta(days=7)
+    anchor = poll_start(record).astimezone(ZoneInfo(c["timezone"])).date() + timedelta(days=7)
     all_dates = sorted({s[:10] for s in slots})
     for week_no in range(c["weeks"]):
         first_day = anchor + timedelta(days=week_no * 7)
@@ -123,7 +147,7 @@ def build_event_embed(record, rsvps):
         desc += f"\n**Discord Event:** {event_link(record['guild_id'], record['discord_event_id'])}"
     if record["forum_thread_id"]:
         desc += f"\n**Session thread:** <#{record['forum_thread_id']}>"
-    embed = discord.Embed(title=f"🐉 {c['title']} — Session RSVP", description=desc,
+    embed = discord.Embed(title=f"🐉 {event_title(c)} — Session RSVP", description=desc,
                           color=0x2ECC71)
     if confirmed:
         shown = " ".join(f"<@{u}>" for u in confirmed[:30])
@@ -239,7 +263,7 @@ class EventMessageView(discord.ui.View):
         c = record["config"]
         if record["event_start"] and record["event_end"]:
             self.add_item(discord.ui.Button(label="Add to Google Calendar", style=discord.ButtonStyle.link,
-                url=google_calendar_url(c["title"], c["description"][:180], dtread(record["event_start"]), dtread(record["event_end"]))))
+                url=google_calendar_url(event_title(c), c["description"][:180], dtread(record["event_start"]), dtread(record["event_end"]))))
 
     async def rsvp(self, interaction):
         async with self.bot.lock_for(self.guild_id):
@@ -257,7 +281,7 @@ class EventMessageView(discord.ui.View):
         if promoted and promoted != interaction.user.id:
             try:
                 person = await self.bot.fetch_user(promoted)
-                await person.send(f"A seat opened for **{record['config']['title']}**. Your D&D RSVP is now confirmed!")
+                await person.send(f"A seat opened for **{event_title(record['config'])}**. Your D&D RSVP is now confirmed!")
             except discord.HTTPException:
                 pass
 
@@ -266,7 +290,7 @@ class EventMessageView(discord.ui.View):
         if not record or record["cycle"] != self.cycle or not record["event_start"]:
             return await interaction.response.send_message("This calendar event is no longer available.", ephemeral=True)
         c = record["config"]
-        data = make_ics(c["title"], c["description"], dtread(record["event_start"]),
+        data = make_ics(event_title(c), c["description"], dtread(record["event_start"]),
                         dtread(record["event_end"]), f"{self.guild_id}-{self.cycle}@dnd-scheduler")
         await interaction.response.send_message("Import this `.ics` file into Apple Calendar, Outlook, or another calendar:",
               file=discord.File(io.BytesIO(data), filename="dnd-session.ics"), ephemeral=True)
@@ -278,6 +302,9 @@ class SchedulerBot(commands.Bot):
                          allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=False))
         self.store = Store(DB_PATH)
         self.guild_locks = {}
+        self._started_guilds = set()
+        self._lifecycle_lock = asyncio.Lock()
+        self._closing = False
 
     def lock_for(self, guild_id):
         return self.guild_locks.setdefault(guild_id, asyncio.Lock())
@@ -301,12 +328,85 @@ class SchedulerBot(commands.Bot):
 
     async def on_ready(self):
         log.info("Logged in as %s (%s)", self.user, self.user.id)
+        # on_ready can be called more than once after gateway reconnects.
+        async with self._lifecycle_lock:
+            if self._closing:
+                return
+            for guild in self.guilds:
+                if guild.id in self._started_guilds:
+                    continue
+                channel = self.scheduler_channel(guild)
+                if channel is None:
+                    log.warning("No #scheduler channel in guild %s for lifecycle notices", guild.id)
+                    continue
+                previous_run_did_not_stop_cleanly = await self.store.mark_service_started(guild.id)
+                try:
+                    if previous_run_did_not_stop_cleanly:
+                        await asyncio.wait_for(channel.send("Fly Services Have Shutdown\n"
+                                           "*(Previous shutdown detected on restart; the bot could not notify while offline.)*"), timeout=5)
+                    await asyncio.wait_for(channel.send("Fly Services Have Started"), timeout=5)
+                except (discord.HTTPException, asyncio.TimeoutError):
+                    log.exception("Could not publish startup notice in guild %s", guild.id)
+                else:
+                    self._started_guilds.add(guild.id)
+
+    async def close(self):
+        # Fly sends SIGINT/SIGTERM on graceful Machine shutdown. This cannot
+        # run after SIGKILL, a power loss, or a fatal interpreter failure.
+        async with self._lifecycle_lock:
+            if not self._closing:
+                self._closing = True
+                for guild in self.guilds:
+                    if guild.id not in self._started_guilds:
+                        continue
+                    channel = self.scheduler_channel(guild)
+                    if channel is None:
+                        log.warning("No scheduler channel for shutdown notice: %s", guild.id)
+                        continue
+                    try:
+                        await asyncio.wait_for(channel.send("Fly Services Have Shutdown"), timeout=5)
+                        await self.store.mark_service_stopped(guild.id)
+                    except (discord.HTTPException, asyncio.TimeoutError):
+                        # Preserve the 'running' flag. The next startup will
+                        # report the unclean shutdown retrospectively.
+                        log.exception("Could not publish shutdown notice in guild %s", guild.id)
+        await super().close()
+
+    def scheduler_channel(self, guild):
+        # Explicit channel ID takes priority; otherwise require #scheduler.
+        raw_id = os.getenv("SCHEDULER_CHANNEL_ID", "").strip()
+        if raw_id:
+            try:
+                channel = guild.get_channel(int(raw_id))
+            except ValueError:
+                log.error("SCHEDULER_CHANNEL_ID must be a numeric Discord channel ID")
+                return None
+            return channel if isinstance(channel, discord.TextChannel) else None
+        return next((c for c in guild.text_channels if c.name.lower() == "scheduler"), None)
 
     def text_channel(self, guild, config=None):
-        channel_id = int(os.getenv("SCHEDULING_CHANNEL_ID") or 0) or (config or {}).get("channel_id")
-        channel = guild.get_channel(channel_id) if channel_id else None
-        if isinstance(channel, discord.TextChannel): return channel
-        return next((c for c in guild.text_channels if "scheduling" in c.name.lower()), None)
+        # Public polls/RSVP/reminders must NEVER be routed into the private
+        # #scheduler control channel, even when a saved configuration predates
+        # the private/public channel split.
+        control = self.scheduler_channel(guild)
+        explicit = os.getenv("SCHEDULING_CHANNEL_ID", "").strip()
+        if explicit:
+            try:
+                target = guild.get_channel(int(explicit))
+            except ValueError:
+                log.error("SCHEDULING_CHANNEL_ID must be a numeric Discord channel ID")
+                return None
+            if not isinstance(target, discord.TextChannel) or (control and target.id == control.id):
+                log.error("SCHEDULING_CHANNEL_ID must point to a public text channel, not #scheduler")
+                return None
+            return target
+        saved_id = (config or {}).get("channel_id")
+        if saved_id:
+            channel = guild.get_channel(int(saved_id))
+            if isinstance(channel, discord.TextChannel) and (not control or channel.id != control.id):
+                return channel
+        return next((c for c in guild.text_channels
+                     if "scheduling" in c.name.lower() and (not control or c.id != control.id)), None)
 
     def forum_channel(self, guild):
         target = int(os.getenv("FORUM_CHANNEL_ID") or 0)
@@ -321,7 +421,7 @@ class SchedulerBot(commands.Bot):
     def slots_for(self, record):
         c = record["config"]
         end = dtread(record["poll_deadline"])
-        return slot_keys(c, end - timedelta(days=c["poll_duration"]), end)
+        return slot_keys(c, poll_start(record), end)
 
     async def try_delete_message(self, guild, channel_id, message_id):
         if not channel_id or not message_id: return
@@ -363,7 +463,8 @@ class SchedulerBot(commands.Bot):
                 raise ValueError("Create a Forum channel named dnd-session-events, or set FORUM_CHANNEL_ID.")
             config["channel_id"] = channel.id
             validate_config(config)
-            fake = {"config": config, "poll_deadline": (utcnow() + timedelta(days=config["poll_duration"])).isoformat()}
+            window = timedelta(minutes=1) if is_test(config) else timedelta(days=config["poll_duration"])
+            fake = {"config": config, "poll_deadline": (utcnow() + window).isoformat()}
             if not self.slots_for(fake):
                 raise ValueError("No valid dates/times remain after poll close; change the weekdays, times, or weeks.")
             await self.cleanup(guild)
@@ -372,7 +473,7 @@ class SchedulerBot(commands.Bot):
 
     async def prepare_poll(self, guild, config, cycle):
         now = utcnow()
-        deadline = now + timedelta(days=config["poll_duration"])
+        deadline = now + (timedelta(minutes=1) if is_test(config) else timedelta(days=config["poll_duration"]))
         await self.store.put(guild.id, config, cycle, "poll_preparing",
                              poll_deadline=deadline.isoformat(), poll_channel_id=config["channel_id"])
 
@@ -410,12 +511,19 @@ class SchedulerBot(commands.Bot):
                 await msg.edit(embed=build_poll_embed(record, votes, closed=True, winner=chosen), view=None)
             except discord.HTTPException:
                 log.exception("Could not close poll message")
-        if not chosen:
+        if not chosen and not is_test(record["config"]):
             log.info("No valid votes in guild %s; starting another poll", guild.id)
             await self.prepare_poll(guild, record["config"], record["cycle"] + 1)
             await self.publish_poll(guild, await self.store.get(guild.id))
             return
-        start, end = event_datetimes(chosen, record["config"])
+        if is_test(record["config"]):
+            # The test is a quick smoke-test of the event pipeline. Poll choices
+            # are informational and affect RSVP ordering, not the test date/time.
+            # Even with zero votes, always create the one-minute test event.
+            start = utcnow() + timedelta(minutes=1)
+            end = start + timedelta(minutes=1)
+        else:
+            start, end = event_datetimes(chosen, record["config"])
         await self.store.set_initial_rsvps(guild.id, record["cycle"], users,
                                            record["config"]["attendee_limit"])
         await self.store.update(guild.id, state="creating_event", selected_slot=chosen,
@@ -436,7 +544,7 @@ class SchedulerBot(commands.Bot):
                 event_id = existing.id
             else:
                 voice = self.voice_channel(guild)
-                params = dict(name=c["title"], start_time=start, end_time=end,
+                params = dict(name=event_title(c), start_time=start, end_time=end,
                               description=(c["description"][:800] + "\n" + marker))
                 if voice:
                     params["channel"] = voice
@@ -457,7 +565,7 @@ class SchedulerBot(commands.Bot):
                        f"DM: <@{c['dm_id']}>\n"
                        f"Discord Event: {event_link(guild.id, event_id)}\n\n"
                        "RSVP in the scheduling channel; discuss characters and preparations here.")
-            created = await forum.create_thread(name=f"{c['title']} — {start.astimezone(ZoneInfo(c['timezone'])).strftime('%b %d')}",
+            created = await forum.create_thread(name=f"{event_title(c)} — {start.astimezone(ZoneInfo(c['timezone'])).strftime('%b %d')}",
                                                 content=message)
             thread_id = created.thread.id
             await self.store.update(guild.id, forum_thread_id=thread_id)
@@ -513,7 +621,9 @@ class SchedulerBot(commands.Bot):
         except (discord.HTTPException, ValueError):
             log.exception("Native Discord event lifecycle action failed: %s", id_)
 
-    @tasks.loop(seconds=45)
+    # A short interval keeps the one-minute test flow responsive (regular
+    # schedules still only perform actions when their saved deadline is due).
+    @tasks.loop(seconds=5)
     async def worker(self):
         for row in await self.store.all():
             guild = self.get_guild(row["guild_id"])
@@ -532,7 +642,7 @@ class SchedulerBot(commands.Bot):
                         await self.create_event(guild, r)
                     elif r["state"] == "event":
                         start, end = dtread(r["event_start"]), dtread(r["event_end"])
-                        if not r["reminded"] and start - timedelta(hours=r["config"]["reminder_before_event"]) <= now < end:
+                        if not is_test(r["config"]) and not r["reminded"] and start - timedelta(hours=r["config"]["reminder_before_event"]) <= now < end:
                             await self.send_reminder(guild, r)
                         if start <= now < end:
                             await self.sync_native_event(guild, r)
@@ -560,6 +670,16 @@ bot = SchedulerBot()
 async def admin_gate(interaction):
     if not interaction.guild or not is_admin(interaction.user):
         await interaction.response.send_message("Only server admins or users with Manage Server can control the scheduler.", ephemeral=True)
+        return False
+    channel = bot.scheduler_channel(interaction.guild)
+    if channel is None:
+        await interaction.response.send_message(
+            "Create a private text channel named `scheduler`, or configure SCHEDULER_CHANNEL_ID with its channel ID.",
+            ephemeral=True)
+        return False
+    if interaction.channel_id != channel.id:
+        await interaction.response.send_message(
+            f"Scheduler commands can only be used in {channel.mention}.", ephemeral=True)
         return False
     return True
 
@@ -606,8 +726,13 @@ async def reset_scheduler(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
         old = await bot.store.get(interaction.guild.id)
-        c = old["config"] if old else config_defaults(interaction.guild, interaction.user.id, interaction.channel_id)
+        previous = old["config"] if old else None
+        # A test run never becomes the new campaign template.
+        if previous and is_test(previous):
+            previous = previous.get("previous_normal_config")
+        c = dict(previous) if previous else config_defaults(interaction.guild, interaction.user.id, interaction.channel_id)
         c["looping"] = True
+        c["test_mode"] = False
         await bot.replace_scheduler(interaction.guild, c)
         await interaction.followup.send("✅ Scheduler reset. A fresh recurring poll is posted.", ephemeral=True)
     except (ValueError, discord.HTTPException) as exc:
@@ -624,23 +749,59 @@ async def end_scheduler(interaction: discord.Interaction):
     await interaction.followup.send("🛑 Scheduler ended. Active bot poll/RSVP posts and future bot-created Discord events were cleared.", ephemeral=True)
 
 
-@bot.tree.command(name="once_scheduler", description="Replace any active schedule with one poll and one event (no loop)")
+@bot.tree.command(name="once_scheduler", description="Run a one-minute test poll followed by a one-minute test event")
 @app_commands.guild_only()
 async def once_scheduler(interaction: discord.Interaction):
     if not await admin_gate(interaction): return
     await interaction.response.defer(ephemeral=True)
     try:
         old = await bot.store.get(interaction.guild.id)
-        c = old["config"] if old else config_defaults(interaction.guild, interaction.user.id, interaction.channel_id)
-        c["looping"] = False
+        previous = old["config"] if old else None
+        if previous and is_test(previous):
+            previous = previous.get("previous_normal_config")
+        normal_config = (dict(previous) if previous else
+                         config_defaults(interaction.guild, interaction.user.id, interaction.channel_id))
+        c = dict(normal_config)
+        c.update(title="Test Poll", description="One-minute automated scheduler test.",
+                 dm_id=interaction.user.id, test_mode=True, looping=False,
+                 ping_role_id=None, previous_normal_config=normal_config)
         await bot.replace_scheduler(interaction.guild, c)
-        await interaction.followup.send("✅ One-time scheduler started. It will not schedule another poll after the session.", ephemeral=True)
+        await interaction.followup.send(
+            "✅ Test poll posted in the public voting channel (1 minute, no pings). "
+            "After closing, **Test Event** starts in about 1 minute, lasts 1 minute, "
+            "has no reminder, and does not repeat. The event is created even without votes.",
+            ephemeral=True)
     except (ValueError, discord.HTTPException) as exc:
-        await interaction.followup.send(f"Could not start one-time scheduler: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Could not start the scheduler test: {exc}", ephemeral=True)
 
 
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise SystemExit("DISCORD_TOKEN is required (see .env.example)")
-    bot.run(token, log_handler=None)
+    async def run_service():
+        stop_requested = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_requested.set)
+            except (NotImplementedError, RuntimeError):
+                # Signal handling differs on Windows; Fly.io runs Linux.
+                pass
+        async with bot:
+            run_task = asyncio.create_task(bot.start(token))
+            stop_task = asyncio.create_task(stop_requested.wait())
+            try:
+                done, _ = await asyncio.wait({run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                if run_task in done:
+                    await run_task
+            finally:
+                stop_task.cancel()
+                await bot.close()
+                if not run_task.done():
+                    try:
+                        await asyncio.wait_for(run_task, timeout=10)
+                    except asyncio.TimeoutError:
+                        run_task.cancel()
+
+    asyncio.run(run_service())

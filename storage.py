@@ -33,6 +33,11 @@ class Store:
             status TEXT NOT NULL, created_at TEXT NOT NULL,
             PRIMARY KEY (guild_id, cycle, user_id)
         );
+        CREATE TABLE IF NOT EXISTS service_status (
+            guild_id INTEGER PRIMARY KEY,
+            is_running INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """)
         # Safe upgrade for an existing SQLite volume from an earlier release.
         current = {r[1] for r in self.db.execute("PRAGMA table_info(schedulers)")}
@@ -129,3 +134,25 @@ class Store:
                     self.db.execute("UPDATE rsvps SET status='confirmed' WHERE guild_id=? AND cycle=? AND user_id=?",
                                     (guild_id, cycle, promoted))
             return new_status, promoted
+
+    async def mark_service_started(self, guild_id):
+        """Mark a process online; true means prior process stopped uncleanly."""
+        async with self.lock:
+            previous = self.db.execute(
+                "SELECT is_running FROM service_status WHERE guild_id=?", (guild_id,)
+            ).fetchone()
+            self.db.execute(
+                "INSERT INTO service_status (guild_id,is_running,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(guild_id) DO UPDATE SET is_running=excluded.is_running, "
+                "updated_at=excluded.updated_at",
+                (guild_id, 1, datetime.now(timezone.utc).isoformat())
+            )
+            return bool(previous and previous[0])
+
+    async def mark_service_stopped(self, guild_id):
+        """Only mark a clean shutdown after the Discord notice succeeds."""
+        async with self.lock:
+            self.db.execute(
+                "UPDATE service_status SET is_running=0,updated_at=? WHERE guild_id=?",
+                (datetime.now(timezone.utc).isoformat(), guild_id)
+            )

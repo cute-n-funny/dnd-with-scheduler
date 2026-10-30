@@ -76,3 +76,22 @@ class SchedulingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LifecycleStateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_shutdown_and_crash_recovery_flag(self):
+        with TemporaryDirectory() as tmp:
+            filename = str(Path(tmp) / "scheduler.db")
+            store = Store(filename)
+            # Fresh installation: startup should not claim a prior crash.
+            self.assertFalse(await store.mark_service_started(123))
+            store.db.close()
+            # Simulate an unexpected exit: the flag survived restarting SQLite.
+            restarted = Store(filename)
+            self.assertTrue(await restarted.mark_service_started(123))
+            await restarted.mark_service_stopped(123)
+            restarted.db.close()
+            # A normal stop must not be reported as a crash.
+            final_start = Store(filename)
+            self.assertFalse(await final_start.mark_service_started(123))
+            final_start.db.close()

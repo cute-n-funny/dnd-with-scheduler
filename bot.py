@@ -17,6 +17,7 @@ from discord.ext import commands, tasks
 from logic import (choose_slot, event_datetimes, google_calendar_url, make_ics,
                    parse_days, parse_times, slot_keys)
 from storage import Store
+from heatmap import render_heatmaps
 
 log = logging.getLogger("dnd_scheduler")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -151,6 +152,47 @@ def build_poll_embed(record, votes, *, closed=False, winner=None):
         embed.add_field(name="No remaining dates", value="No valid future slots in this poll.", inline=False)
     embed.set_footer(text="Earliest slot reaching the attendee limit in distinct voters wins; if none qualifies, popularity decides. DM-voted dates take priority.")
     return embed
+
+
+def build_visual_poll(record, votes, *, closed=False, winner=None):
+    """Return text summary, weekly image embeds, and replaceable PNG uploads.
+
+    If image rendering fails, retain the existing accessible text-grid poll.
+    The same message and persistent vote button are kept across updates.
+    """
+    summary = build_poll_embed(record, votes, closed=closed, winner=winner)
+    try:
+        charts = render_heatmaps(record, votes, closed=closed, winner=winner)
+    except Exception:
+        log.exception("Heatmap render failed; using text-grid poll")
+        return [summary], []
+    if not charts:
+        return [summary], []
+
+    # Avoid duplicating the tall grid below the images. Keep readable textual
+    # top choices for accessibility and people who disable image previews.
+    summary.clear_fields()
+    slots = set(slot_keys(record["config"], poll_start(record),
+                          dtread(record["poll_deadline"])))
+    slot_voters = {}
+    for vote in votes:
+        if vote["slot"] in slots:
+            slot_voters.setdefault(vote["slot"], set()).add(vote["user_id"])
+    highest = sorted(slot_voters, key=lambda slot: (-len(slot_voters[slot]), slot))[:5]
+    top = "\n".join(f"• {slot_label(slot)}: **{len(slot_voters[slot])}**"
+                     for slot in highest) or "No availability votes yet."
+    summary.add_field(name="Most popular slots", value=top, inline=False)
+    summary.add_field(name="Heatmap legend",
+                      value="Gray: 0 · Red: low · Orange: growing · Yellow: nearly full · Green: attendee limit met. "
+                            "Each square shows the number of distinct players.", inline=False)
+    images = []
+    files = []
+    for name, image_bytes in charts:
+        embed = discord.Embed(color=0x2B2D31)
+        embed.set_image(url=f"attachment://{name}")
+        images.append(embed)
+        files.append(discord.File(io.BytesIO(image_bytes), filename=name))
+    return [summary, *images], files
 
 
 def build_event_embed(record, rsvps):
@@ -698,10 +740,17 @@ class SchedulerBot(commands.Bot):
             await self.store.carry_forward_votes(
                 guild.id, record["cycle"] - 1, record["cycle"], self.slots_for(record))
         view = PollMessageView(self, guild.id, record["cycle"])
-        message = await channel.send(content=mention(record["config"], guild),
-                         embed=build_poll_embed(record,
-                                                await self.store.votes(guild.id, record["cycle"])),
-                         view=view)
+        votes = await self.store.votes(guild.id, record["cycle"])
+        embeds, files = build_visual_poll(record, votes)
+        try:
+            message = await channel.send(content=mention(record["config"], guild),
+                                         embeds=embeds, files=files, view=view)
+        except discord.HTTPException:
+            if not files:
+                raise
+            log.exception("Could not upload heatmap; posting text-grid poll instead")
+            message = await channel.send(content=mention(record["config"], guild),
+                                         embed=build_poll_embed(record, votes), view=view)
         await self.store.update(guild.id, state="poll", poll_message_id=message.id)
         log.info("Published poll guild=%s cycle=%s", guild.id, record["cycle"])
 
@@ -711,7 +760,15 @@ class SchedulerBot(commands.Bot):
         try:
             channel = self.get_channel(record["poll_channel_id"]) or await self.fetch_channel(record["poll_channel_id"])
             message = await channel.fetch_message(record["poll_message_id"])
-            await message.edit(embed=build_poll_embed(record, await self.store.votes(guild_id, record["cycle"])))
+            votes = await self.store.votes(guild_id, record["cycle"])
+            embeds, files = build_visual_poll(record, votes)
+            try:
+                # Replacing attachments on the original poll message means
+                # repeated votes do not spam the channel with new messages.
+                await message.edit(embeds=embeds, attachments=files)
+            except discord.HTTPException:
+                log.exception("Heatmap update failed; falling back to text grid")
+                await message.edit(embed=build_poll_embed(record, votes), attachments=[])
         except discord.HTTPException:
             log.exception("Poll refresh failed")
 
@@ -724,7 +781,13 @@ class SchedulerBot(commands.Bot):
             try:
                 channel = self.get_channel(record["poll_channel_id"]) or await self.fetch_channel(record["poll_channel_id"])
                 msg = await channel.fetch_message(record["poll_message_id"])
-                await msg.edit(embed=build_poll_embed(record, votes, closed=True, winner=chosen), view=None)
+                embeds, files = build_visual_poll(record, votes, closed=True, winner=chosen)
+                try:
+                    await msg.edit(embeds=embeds, attachments=files, view=None)
+                except discord.HTTPException:
+                    log.exception("Could not upload final heatmap; using text grid")
+                    await msg.edit(embed=build_poll_embed(record, votes, closed=True, winner=chosen),
+                                   attachments=[], view=None)
             except discord.HTTPException:
                 log.exception("Could not close poll message")
         if not chosen and not is_test(record["config"]):

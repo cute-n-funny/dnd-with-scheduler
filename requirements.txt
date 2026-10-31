@@ -1,1 +1,2 @@
 discord.py==2.7.1
+Pillow>=11.0,<13.0

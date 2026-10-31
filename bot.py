@@ -761,7 +761,8 @@ class SchedulerBot(commands.Bot):
             else:
                 voice = self.voice_channel(guild)
                 params = dict(name=event_title(c), start_time=start, end_time=end,
-                              description=(c["description"][:800] + "\n" + marker))
+                              description=(c["description"][:800] + "\n" + marker),
+                              privacy_level=discord.PrivacyLevel.guild_only)
                 if voice:
                     params["channel"] = voice
                 else:

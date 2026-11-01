@@ -115,7 +115,10 @@ def choose_slot(votes: list[dict], valid_slots: list[str], dm_id: int, rng=None,
         if vote["slot"] == selected:
             user_id = vote["user_id"]
             first_vote_by_user[user_id] = min(first_vote_by_user.get(user_id, vote["created_at"]), vote["created_at"])
-    ordered_users = sorted(first_vote_by_user, key=lambda user: (first_vote_by_user[user], user))
+    # The DM is first when they voted for the exact winning slot. Everyone
+    # else retains first-vote priority. A DM who did not qualify is not added.
+    ordered_users = sorted(first_vote_by_user,
+                           key=lambda user: (user != dm_id, first_vote_by_user[user], user))
     return selected, ordered_users
 
 

@@ -184,9 +184,9 @@ class PanelTests(unittest.TestCase):
                 'Add Times','Remove Times','Close'])
             self.assertEqual(panel.target_days,set())
             self.assertFalse(any(opt.default for opt in panel.day_select.options))
-            self.assertEqual(panel.selected_hours,1)
+            self.assertEqual(panel.selected_hours,3)
             self.assertEqual([int(o.value) for o in panel.hours_select.options],list(range(1,9)))
-            self.assertEqual([o.value for o in panel.hours_select.options if o.default],['1'])
+            self.assertEqual([o.value for o in panel.hours_select.options if o.default],['3'])
             self.assertNotIn('Press **Save**',panel.embed().description)
 
     def test_hours_options_one_to_configured_maximum(self):
@@ -196,7 +196,7 @@ class PanelTests(unittest.TestCase):
                 panel = self.make_panel(ui)
                 self.assertEqual([int(o.value) for o in panel.hours_select.options],
                                  list(range(1,maximum+1)))
-                self.assertEqual(panel.selected_hours,1)
+                self.assertEqual(panel.selected_hours,3)
 
     def test_week_switch_clears_dates(self):
         with mocked_discord() as ui:
@@ -223,8 +223,8 @@ class PanelTests(unittest.TestCase):
             self.assertEqual(self.bot.refreshed,1)
             windows=asyncio.run(read_windows(self.store,4,1,9))
             self.assertEqual(len(windows),2)
-            self.assertEqual([w['hours'] for w in windows],[1,1])
-            # 1-hour windows cannot qualify as a four-hour event.
+            self.assertEqual([w['hours'] for w in windows],[3,3])
+            # 3-hour windows cannot qualify as a four-hour event.
             self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM votes').fetchone()[0],0)
             panel.hours_select.values=['4']
             asyncio.run(panel.choose_hours(FakeInteraction()))

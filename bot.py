@@ -50,11 +50,47 @@ def poll_start(record):
     return end - window
 
 
+def players_mention(guild):
+    """Use the real Players role ID; never fall back to @everyone."""
+    role = next((r for r in getattr(guild, "roles", ())
+                 if r.name.casefold() == "players"), None)
+    if role is None:
+        log.warning("Players role not found in guild %s; no role ping sent", guild.id)
+        return ""
+    return role.mention
+
+
 def mention(config, guild):
+    """Normal polls/reminders use Players unless an admin selected a custom role."""
     if is_test(config):
-        return ""  # The test poll and test event never ping @everyone or a role.
+        return ""  # Test mode never sends role pings.
     role_id = config.get("ping_role_id")
-    return f"<@&{role_id}>" if role_id and role_id != guild.id else "@everyone"
+    if role_id and role_id != guild.id:
+        role = next((r for r in getattr(guild, "roles", ()) if r.id == role_id), None)
+        if role:
+            return role.mention
+    return players_mention(guild)
+
+
+def session_announcement(config, guild, rsvps):
+    """One-time text with calendar reminder and auto-confirmed voters."""
+    calendar = ("📅 Remember to save this session using **Download iCal (.ics)** "
+                "or **Add to Google Calendar** below.")
+    ping = "" if is_test(config) else players_mention(guild)
+    lines = [f"{ping} {calendar}".strip()]
+    confirmed = [r["user_id"] for r in rsvps if r["status"] == "confirmed"]
+    if confirmed:
+        prefix = "✅ The following users have been added after voting: "
+        roster = []
+        for uid in confirmed:
+            name = f"<@{uid}>"
+            if len("\n\n".join(lines)) + len(prefix) + sum(map(len, roster)) + len(roster) + len(name) > 1850:
+                break
+            roster.append(name)
+        remaining = len(confirmed) - len(roster)
+        suffix = f" (+{remaining} more confirmed; see RSVP list)" if remaining else ""
+        lines.append(prefix + " ".join(roster) + suffix)
+    return "\n\n".join(lines)
 
 
 def is_admin(user):
@@ -901,8 +937,11 @@ class SchedulerBot(commands.Bot):
             channel = self.text_channel(guild, c)
             if not channel: raise ValueError("Scheduling channel not found")
             rsvps = await self.store.rsvps(guild.id, record["cycle"])
-            msg = await channel.send(content=mention(c, guild), embed=build_event_embed(record, rsvps),
-                                     view=EventMessageView(self, record))
+            msg = await channel.send(content=session_announcement(c, guild, rsvps),
+                                     embed=build_event_embed(record, rsvps),
+                                     view=EventMessageView(self, record),
+                                     allowed_mentions=discord.AllowedMentions(
+                                         everyone=False, roles=True, users=False))
             await self.store.update(guild.id, event_channel_id=channel.id, event_message_id=msg.id)
         await self.store.update(guild.id, state="event")
         log.info("Created session event guild=%s cycle=%s", guild.id, record["cycle"])
@@ -1083,7 +1122,7 @@ async def scheduler_status(interaction: discord.Interaction):
     attendee_limit="Maximum number of confirmed attendees (1–99)",
     poll_after_event="Hours after the event ends before next poll (3–24)",
     reminder_before_event="Hours before session START to remind players (3–24)",
-    ping_role="Role pinged on polls, events, and reminders (default everyone)",
+    ping_role="Optional poll/reminder role (default Players; events always ping Players)",
     event_duration="Session duration in hours (1–24)",
     hours="Maximum availability duration in hours (3–8; 1-hour steps)")
 async def start_scheduler(interaction: discord.Interaction, title: str = "Title",

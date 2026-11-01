@@ -31,7 +31,7 @@ class AvailabilityVotePanel(discord.ui.View):
         self.target_starts=set()
         # The hours limit controls the *largest* choice, not the initial choice.
         self.max_hours=max(3,min(8,int(self.config.get('hours',8))))
-        self.selected_hours=1
+        self.selected_hours=3
         # Legacy per-slot ballots can be reopened and edited without disappearing.
         previous={(w['day'],w['start']):int(w['hours']) for w in saved_windows}
         if not previous:

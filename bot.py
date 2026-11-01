@@ -76,7 +76,7 @@ def validate_config(c):
     for key, lo, hi in (("weeks", 1, 4), ("poll_duration", 3, 7),
                         ("poll_after_event", 3, 24), ("reminder_before_event", 3, 24),
                         ("attendee_limit", 1, 99), ("event_duration", 1, 24),
-                        ("hours", 1, 8)):
+                        ("hours", 3, 8)):
         if not lo <= c.get(key, 8 if key == 'hours' else -1) <= hi:
             raise ValueError(f"{key} must be between {lo} and {hi}.")
     if not c["title"].strip() or len(c["title"]) > 100:
@@ -1084,7 +1084,8 @@ async def scheduler_status(interaction: discord.Interaction):
     poll_after_event="Hours after the event ends before next poll (3–24)",
     reminder_before_event="Hours before session START to remind players (3–24)",
     ping_role="Role pinged on polls, events, and reminders (default everyone)",
-    event_duration="Session duration in hours (1–24)")
+    event_duration="Session duration in hours (1–24)",
+    hours="Maximum availability duration in hours (3–8; 1-hour steps)")
 async def start_scheduler(interaction: discord.Interaction, title: str = "Title",
     description: str = "Description for event", dm: discord.Member | None = None,
     weeks: int = 2, days: str = "", times: str = "",

@@ -118,11 +118,11 @@ class AvailabilityTests(unittest.TestCase):
         record=dict(guild_id=1,cycle=1,config=cfg)
         panel=ns['AvailabilityVotePanel'](None,record,10,slots,[],[])
         self.assertEqual(len(panel.weeks),4)
-        self.assertEqual([child.row for child in panel.children],[0,1,2,3]+[4]*5)
+        self.assertEqual([child.row for child in panel.children],[0,1,2,3]+[4]*3)
         self.assertTrue(all(len(getattr(child,'options',[]))<=25 for child in panel.children))
         self.assertEqual(len(panel.day_select.options),7)
         self.assertEqual(len(panel.hour_options()),8)
-        self.assertEqual(panel.selected_hours,8)
+        self.assertEqual(panel.selected_hours,1)
 
     def test_hours_validation_rejects_out_of_range_and_mismatched_dates(self):
         with TemporaryDirectory() as d:

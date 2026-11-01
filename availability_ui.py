@@ -27,9 +27,11 @@ class AvailabilityVotePanel(discord.ui.View):
         self.times=sorted({s[11:] for s in slots})
         self.weeks=sorted({_sunday(date.fromisoformat(day)) for day in self.days})
         self.week=self.weeks[0]
-        self.target_days={self.visible_days()[0]}
+        self.target_days=set()
         self.target_starts=set()
-        self.selected_hours=min(self.config.get('hours',8),8)
+        # The hours limit controls the *largest* choice, not the initial choice.
+        self.max_hours=max(3,min(8,int(self.config.get('hours',8))))
+        self.selected_hours=1
         # Legacy per-slot ballots can be reopened and edited without disappearing.
         previous={(w['day'],w['start']):int(w['hours']) for w in saved_windows}
         if not previous:
@@ -56,11 +58,9 @@ class AvailabilityVotePanel(discord.ui.View):
         self.hours_select.callback=self.choose_hours
         self.add_item(self.hours_select)
         for label,style,callback in (
-            ('Add / Update',discord.ButtonStyle.primary,self.add_windows),
-            ('Remove',discord.ButtonStyle.secondary,self.remove_windows),
-            ('Clear Dates',discord.ButtonStyle.secondary,self.clear_dates),
-            ('Save',discord.ButtonStyle.success,self.save),
-            ('Copy Previous',discord.ButtonStyle.secondary,self.copy_previous)):
+            ('Add Times',discord.ButtonStyle.primary,self.add_windows),
+            ('Remove Times',discord.ButtonStyle.secondary,self.remove_windows),
+            ('Close',discord.ButtonStyle.secondary,self.close)):
             button=discord.ui.Button(label=label,style=style,row=4)
             button.callback=callback
             self.add_item(button)
@@ -83,7 +83,7 @@ class AvailabilityVotePanel(discord.ui.View):
     def hour_options(self):
         return [discord.SelectOption(label=f'{h} hour'+('' if h==1 else 's'),
             value=str(h),default=h==self.selected_hours)
-            for h in range(1,self.config.get('hours',8)+1)]
+            for h in range(1,self.max_hours+1)]
 
     def redraw(self):
         self.week_select.options=self.week_options()
@@ -99,21 +99,20 @@ class AvailabilityVotePanel(discord.ui.View):
         text='\n'.join(preview[:14]) or 'No availability saved yet.'
         if len(preview)>14:
             text+=f'\n…plus {len(preview)-14} more windows.'
-        state='⚠️ Unsaved changes' if self.selected!=self.saved else '✅ Saved'
         return discord.Embed(title='🗓️ Your Availability',color=0x5865F2,
             description=('Select a **week**, one or more **dates**, **start time(s)**, '
-                'and how many **hours** you can stay. Press **Add / Update**, repeat '
-                'as needed, then **Save**.\n\n'
+                'and how many **hours** you can stay. **Add Times** and '
+                '**Remove Times** save immediately. Press **Close** when finished.\n\n'
                 f'**Start:** {", ".join(_label(t) for t in sorted(self.target_starts)) or "Choose a time"}\n'
                 f'**Duration:** {self.selected_hours} hours\n'
                 f'**Timezone:** `{self.config["timezone"]}`\n'
                 f'**Event duration:** {self.config["event_duration"]} hours '
                 '(only windows covering the entire event count toward scheduling).\n\n'
-                f'**Your windows ({len(self.selected)}):**\n{text}\n\n{state}\n{note}'))
+                f'**Saved availability ({len(self.selected)}):**\n{text}\n\n{note}'))
 
     async def choose_week(self,interaction):
         self.week=date.fromisoformat(self.week_select.values[0])
-        self.target_days={self.visible_days()[0]}
+        self.target_days=set()
         self.redraw()
         await interaction.response.edit_message(embed=self.embed(),view=self)
 
@@ -133,55 +132,81 @@ class AvailabilityVotePanel(discord.ui.View):
         await interaction.response.edit_message(embed=self.embed(),view=self)
 
     async def add_windows(self,interaction):
-        if not self.target_starts:
-            return await interaction.response.edit_message(embed=self.embed('Choose a start time first.'),view=self)
-        for day in self.target_days:
-            for start in self.target_starts:
-                if f'{day}T{start}' in self.valid_slots:
-                    self.selected[(day,start)]=self.selected_hours
-        self.redraw()
-        await interaction.response.edit_message(embed=self.embed('✅ Added / updated windows. Press Save.'),view=self)
+        await self._change_windows(interaction, remove=False)
 
     async def remove_windows(self,interaction):
-        for day in self.target_days:
-            for start in self.target_starts:
-                self.selected.pop((day,start),None)
-        self.redraw()
-        await interaction.response.edit_message(embed=self.embed('Removed selected windows from draft.'),view=self)
+        await self._change_windows(interaction, remove=True)
 
-    async def clear_dates(self,interaction):
-        self.selected={k:v for k,v in self.selected.items() if k[0] not in self.target_days}
-        self.redraw()
-        await interaction.response.edit_message(embed=self.embed('Cleared selected dates from draft.'),view=self)
+    async def _change_windows(self, interaction, *, remove):
+        """Apply the requested edit to the latest DB values, then save atomically.
 
-    async def copy_previous(self,interaction):
-        old=await read_windows(self.bot.store,self.guild_id,self.cycle-1,self.user_id)
-        if not old:
-            return await interaction.response.edit_message(embed=self.embed('No previous interval preferences to copy.'),view=self)
-        preferences={(date.fromisoformat(w['day']).weekday(),w['start']):w['hours'] for w in old}
-        for day in self.days:
-            for t in self.times:
-                h=preferences.get((date.fromisoformat(day).weekday(),t))
-                if h is not None and f'{day}T{t}' in self.valid_slots:
-                    self.selected[(day,t)]=min(h,self.config.get('hours',8))
-        self.redraw()
-        await interaction.response.edit_message(embed=self.embed('Copied matching weekdays into your draft. Review and Save.'),view=self)
-
-    async def save(self,interaction):
-        if interaction.user.id!=self.user_id:
-            return await interaction.response.send_message('This panel belongs to another player.',ephemeral=True)
+        There is deliberately no draft/Save step: every successful Add/Remove
+        action updates availability_windows and eligible votes in one transaction.
+        """
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message(
+                'This panel belongs to another player.', ephemeral=True)
+        if not self.target_days:
+            return await interaction.response.edit_message(
+                embed=self.embed('Select one or more dates first.'), view=self)
+        if not self.target_starts:
+            return await interaction.response.edit_message(
+                embed=self.embed('Select one or more start times first.'), view=self)
+        edits={(day,start) for day in self.target_days for start in self.target_starts}
         async with self.bot.lock_for(self.guild_id):
             record=await self.bot.store.get(self.guild_id)
             if not record or record['state']!='poll' or record['cycle']!=self.cycle or datetime.now(timezone.utc)>=datetime.fromisoformat(record['poll_deadline']):
-                return await interaction.response.send_message('This poll is closed.',ephemeral=True)
-            if any(f'{day}T{start}' not in set(self.bot.slots_for(record)) for day,start in self.selected):
-                return await interaction.response.send_message('Availability is no longer valid; reopen the poll.',ephemeral=True)
-            qualifying=await save_windows(self.bot.store,self.guild_id,self.cycle,self.user_id,
-                [(day,start,h) for (day,start),h in self.selected.items()],
-                self.bot.slots_for(record),record['config']['event_duration'],record['config'].get('hours',8))
-        self.saved=dict(self.selected)
+                return await interaction.response.edit_message(
+                    embed=self.embed('This poll has closed. Reopen a current poll to vote.'),
+                    view=None)
+            slots=set(self.bot.slots_for(record))
+            if not all(f'{day}T{start}' in slots for day,start in edits):
+                return await interaction.response.edit_message(
+                    embed=self.embed('Some selected dates or times are no longer valid. Reopen this poll.'),
+                    view=self)
+
+            # Read the latest vote state under the guild lock to prevent two
+            # concurrently open ephemeral panels from clobbering each other.
+            existing=await read_windows(self.bot.store,self.guild_id,self.cycle,self.user_id)
+            windows={(w['day'],w['start']):int(w['hours']) for w in existing}
+            if not existing:
+                # Preserve ballots created with the older, per-slot voting UI.
+                previous_votes=await self.bot.store.user_votes(self.guild_id,self.cycle,self.user_id)
+                legacy_hours=min(self.max_hours, record['config']['event_duration'])
+                windows={(v['slot'][:10],v['slot'][11:]):legacy_hours
+                         for v in previous_votes if v['slot'] in slots}
+            for key in edits:
+                if remove:
+                    windows.pop(key,None)
+                else:
+                    windows[key]=self.selected_hours
+            try:
+                qualifying=await save_windows(
+                    self.bot.store,self.guild_id,self.cycle,self.user_id,
+                    [(day,start,h) for (day,start),h in windows.items()],
+                    slots,record['config']['event_duration'],self.max_hours)
+            except ValueError:
+                return await interaction.response.edit_message(
+                    embed=self.embed('Invalid selection. Reopen the poll and try again.'),view=self)
+        self.selected=windows
+        self.saved=dict(windows)
         self.redraw()
+        action='Removed' if remove else 'Added or updated'
         await interaction.response.edit_message(embed=self.embed(
-            f'✅ Saved {len(self.selected)} availability windows. '
-            f'{qualifying} valid session-start votes.'),view=self)
+            f'✅ {action} {len(edits)} date/time combination(s) and saved automatically. '
+            f'{qualifying} eligible session start(s).'),view=self)
         await self.bot.refresh_poll(self.guild_id)
+
+    async def close(self,interaction):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message(
+                'This panel belongs to another player.',ephemeral=True)
+        # Dismiss the ephemeral panel completely. The public voting button
+        # remains in place and will open a fresh panel with saved selections.
+        await interaction.response.defer()
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            await interaction.edit_original_response(
+                content='Availability panel closed.',embed=None,view=None)
+        self.stop()

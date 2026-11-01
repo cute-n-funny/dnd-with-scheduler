@@ -16,8 +16,10 @@ DAY_NAMES = {"mon": 0, "monday": 0, "tue": 1, "tues": 1, "tuesday": 1,
 
 def parse_days(value: str) -> list[int]:
     words = [x.strip().lower() for x in value.split(",")]
-    if not 1 <= len(words) <= 4 or any(x not in DAY_NAMES for x in words):
-        raise ValueError("Days must be 1–4 comma-separated weekdays, such as thur,fri,sat,sun.")
+    if not value.strip():
+        return [6, 0, 1, 2, 3, 4, 5]  # Su, Mo, Tu, We, Th, Fr, Sa
+    if not 1 <= len(words) <= 7 or any(x not in DAY_NAMES for x in words):
+        raise ValueError("Days must be 1–7 comma-separated weekdays, such as sun,mon,tue.")
     result = [DAY_NAMES[x] for x in words]
     if len(result) != len(set(result)):
         raise ValueError("Days cannot contain duplicates.")
@@ -37,6 +39,8 @@ def parse_time(value: str) -> time:
 
 
 def parse_times(value: str) -> list[str]:
+    if not value.strip():
+        return ["14:00", "14:30", "15:00", "15:30", "16:00", "17:00", "18:00", "19:00"]
     pieces = [x.strip() for x in value.split(",")]
     if not 1 <= len(pieces) <= 12:
         raise ValueError("Times must contain 1–12 comma-separated values.")

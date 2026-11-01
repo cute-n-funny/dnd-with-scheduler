@@ -1,139 +1,118 @@
-"""Render per-week availability heatmap PNGs for D&D Scheduler.
-
-Intentionally Discord-independent; works in unit tests and on Fly.io.
-Never creates new message IDs or changes the saved availability records.
-"""
+"""Compact Sunday-first availability heatmaps, with no individual vote counts."""
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
-
 from logic import slot_keys
 
-# Shared dark theme for Discord's dark background; numbers remain readable.
-BACKGROUND = "#181d27"
-PANEL = "#252d3a"
-EMPTY = "#3f4755"
-UNAVAILABLE = "#282f3b"
-TEXT = "#f2f4f8"
-MUTED = "#b9c2d3"
-RED = "#e15868"
-ORANGE = "#e7954e"
-YELLOW = "#f3cc55"
-GREEN = "#35c88d"
+BACKGROUND = '#171b21'
+PANEL = '#242b33'
+EMPTY = '#35404a'
+LIGHT_GREEN = '#a6df91'  # 0-2 voters, including polls before first vote
+GREEN = '#28b567'        # 3+ distinct voters
+RED = '#d95761'          # DM has voted, but is not available at this time
+TEXT = '#f1f4f7'
+MUTED = '#b5bdc8'
 
 
-def _font(size: int, bold: bool = False):
-    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+def _font(size, bold=False):
     try:
-        return ImageFont.truetype(name, size)
+        return ImageFont.truetype('DejaVuSans-Bold.ttf' if bold else 'DejaVuSans.ttf', size)
     except OSError:
-        # Pillow supplies a default font even in minimal python:slim images.
         return ImageFont.load_default(size=size)
 
 
-def _color(count: int, limit: int) -> str:
-    if not count:
-        return EMPTY
-    ratio = count / max(limit, 1)
-    if ratio >= 1:
-        return GREEN
-    if ratio < 0.34:
+def _color(count, dm_has_voted=False, dm_available=True):
+    if dm_has_voted and not dm_available:
         return RED
-    if ratio < 0.7:
-        return ORANGE
-    return YELLOW
+    return GREEN if count >= 3 else LIGHT_GREEN
 
 
-def render_heatmaps(record: dict, votes: list[dict], *, closed=False, winner=None) -> list[tuple[str, bytes]]:
-    """One PNG for each poll week, showing configured times against all 7 days.
+def _week_start(day):
+    """Sunday of the calendar week that contains day."""
+    return day - timedelta(days=(day.weekday() + 1) % 7)
 
-    Each square counts *distinct users* for an exact date+time. Grey cells with
-    an em dash are times/days excluded by the scheduler, not available votes.
-    Image dimensions are fixed/compact enough for Discord embeds and phones.
+
+def _in_window(day, time, window):
+    if window['day'] != day:
+        return False
+    instant = datetime.fromisoformat(f'{day}T{time}')
+    begin = datetime.fromisoformat(f"{day}T{window['start']}")
+    return begin <= instant < begin + timedelta(hours=int(window['hours']))
+
+
+def render_heatmaps(record, votes, *, windows=None, closed=False, winner=None):
+    """Return PNGs only for calendar weeks with at least one submitted vote/window.
+
+    Old-style votes are supported. For users with new interval windows, the
+    supplied vote list should exclude their derived eligible event-start votes.
     """
-    config = record["config"]
-    end = datetime.fromisoformat(record["poll_deadline"])
-    window = timedelta(minutes=1) if config.get("test_mode", False) else timedelta(days=config["poll_duration"])
-    start_date = (end - window).astimezone(ZoneInfo(config["timezone"])).date() + timedelta(days=7)
-    valid_slots = set(slot_keys(config, end - window, end))
-    # Defensive de-duplication even if another input ever supplies repeat votes.
+    c = record['config']
+    deadline = datetime.fromisoformat(record['poll_deadline'])
+    window = timedelta(minutes=1) if c.get('test_mode') else timedelta(days=c['poll_duration'])
+    valid = set(slot_keys(c, deadline-window, deadline))
+    times = sorted(c['times'])
+    windows = windows or []
     voters = defaultdict(set)
     for vote in votes:
-        slot = vote["slot"]
-        if slot in valid_slots:
-            voters[slot].add(vote["user_id"])
+        if vote['slot'] in valid:
+            voters[vote['slot']].add(vote['user_id'])
+    dm = c['dm_id']
+    dm_has_voted = any(v['user_id'] == dm for v in votes) or any(v['user_id'] == dm for v in windows)
+    active = set()
+    for vote in votes:
+        if vote['slot'] in valid:
+            active.add(_week_start(date.fromisoformat(vote['slot'][:10])))
+    valid_days = {s[:10] for s in valid}
+    for item in windows:
+        if item['day'] in valid_days:
+            active.add(_week_start(date.fromisoformat(item['day'])))
+    if not active:
+        return []
 
-    times = sorted(config["times"])
-    limit = max(1, int(config["attendee_limit"]))
-    width = 970
-    left = 105
-    gap = 6
-    col_w = (width - left - 34) // 7
-    row_h = 49
-    top = 166
-    bottom = 98
-    height = top + len(times) * row_h + bottom
-    header = _font(25, True)
-    font = _font(18)
-    bold = _font(19, True)
-    small = _font(16)
-    results = []
-
-    for week_index in range(int(config["weeks"])):
-        first = start_date + timedelta(days=7 * week_index)
-        last = first + timedelta(days=6)
-        image = Image.new("RGB", (width, height), BACKGROUND)
-        draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle((14, 13, width - 14, height - 15), radius=19, fill=PANEL)
-        title = f"Week {week_index + 1}  |  {first:%b %d} - {last:%b %d, %Y}"
-        draw.text((34, 32), title, fill=TEXT, font=header)
-        mode = "CLOSED" if closed else "LIVE AVAILABILITY"
-        draw.text((width - 34, 43), mode, fill=MUTED, font=small, anchor="ra")
-        draw.text((34, 79), f"Timezone: {config['timezone']}    |    {limit} players needed for green", fill=MUTED, font=small)
-
-        for day_index in range(7):
-            day = first + timedelta(days=day_index)
-            cx = left + day_index * (col_w + gap) + col_w // 2
-            draw.text((cx, 119), day.strftime("%a"), fill=TEXT, font=bold, anchor="mm")
-            draw.text((cx, 145), day.strftime("%m/%d"), fill=MUTED, font=small, anchor="mm")
-
-        for row_index, time_text in enumerate(times):
-            y = top + row_index * row_h
-            label = datetime.strptime(time_text, "%H:%M").strftime("%I:%M %p").lstrip("0")
-            draw.text((96, y + 22), label, fill=MUTED, font=small, anchor="rm")
-            for day_index in range(7):
-                day = first + timedelta(days=day_index)
-                slot = f"{day.isoformat()}T{time_text}"
-                x0 = left + day_index * (col_w + gap)
-                y0 = y + 3
-                rect = (x0, y0, x0 + col_w - 4, y0 + 41)
-                enabled = slot in valid_slots
-                count = len(voters[slot]) if enabled else 0
-                shade = _color(count, limit) if enabled else UNAVAILABLE
-                draw.rounded_rectangle(rect, radius=6, fill=shade)
-                if winner == slot:
-                    draw.rounded_rectangle(rect, radius=6, outline="#ffffff", width=4)
-                label = str(count) if enabled else "–"
-                foreground = BACKGROUND if enabled and (count >= limit or 0 < count / limit >= 0.7) else TEXT
-                draw.text(((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2),
-                          label, fill=foreground if enabled else "#8992a3", font=bold, anchor="mm")
-
-        legend = [(EMPTY, "0"), (RED, "Low"), (ORANGE, "Growing"),
-                  (YELLOW, "Almost"), (GREEN, f"{limit}+")]
-        start_x = 46
-        step = 178
-        legend_y = height - 57
-        for index, (color, label) in enumerate(legend):
-            x = start_x + index * step
-            draw.rounded_rectangle((x, legend_y, x + 26, legend_y + 24), radius=5, fill=color)
-            draw.text((x + 34, legend_y + 12), label, fill=TEXT, font=small, anchor="lm")
-
-        content = BytesIO()
-        image.save(content, format="PNG", optimize=True)
-        results.append((f"dnd-availability-week-{week_index + 1}.png", content.getvalue()))
-    return results
+    width, left, top, row_height = 850, 91, 128, 43
+    cell_width, gap = 98, 7
+    height = top + len(times) * row_height + 48
+    title_font, labels, small = _font(22,True), _font(16,True), _font(14)
+    result = []
+    for index, first in enumerate(sorted(active), 1):
+        image = Image.new('RGB', (width,height), BACKGROUND)
+        d = ImageDraw.Draw(image)
+        d.rounded_rectangle((9,9,width-9,height-9),radius=14,fill=PANEL)
+        d.text((26,23), f"Group availability · {first:%b %d}–{first+timedelta(days=6):%b %d}",
+               fill=TEXT,font=title_font)
+        d.text((26,60), c['timezone'],fill=MUTED,font=small)
+        d.text((width-26,61),'CLOSED' if closed else 'LIVE', fill=MUTED,font=small,anchor='ra')
+        for j,abbr in enumerate(('Su','Mo','Tu','We','Th','Fr','Sa')):
+            day = first+timedelta(days=j)
+            center = left+j*(cell_width+gap)+cell_width//2
+            d.text((center,90),abbr,fill=TEXT,font=labels,anchor='mm')
+            d.text((center,111),day.strftime('%m/%d'),fill=MUTED,font=small,anchor='mm')
+        for i,t in enumerate(times):
+            y=top+i*row_height
+            label=datetime.strptime(t,'%H:%M').strftime('%I:%M %p').lstrip('0')
+            d.text((left-11,y+20),label,fill=MUTED,font=small,anchor='rm')
+            for j in range(7):
+                day=(first+timedelta(days=j)).isoformat()
+                slot=f'{day}T{t}'
+                left_x=left+j*(cell_width+gap)
+                rect=(left_x,y+2,left_x+cell_width-4,y+row_height-4)
+                if slot not in valid:
+                    color=EMPTY
+                else:
+                    active_users=set(voters.get(slot,set()))
+                    active_users.update(w['user_id'] for w in windows if _in_window(day,t,w))
+                    color=_color(len(active_users),dm_has_voted,dm in active_users)
+                d.rounded_rectangle(rect,radius=4,fill=color)
+                if winner==slot:
+                    d.rounded_rectangle(rect,radius=4,outline=TEXT,width=3)
+        d.text((27,height-30),'Light green: open  ·  Green: popular  ·  Red: outside DM availability',
+               fill=MUTED,font=small)
+        buff=BytesIO()
+        image.save(buff,'PNG',optimize=True)
+        result.append((f'dnd-availability-week-{first.isoformat()}.png',buff.getvalue()))
+    return result

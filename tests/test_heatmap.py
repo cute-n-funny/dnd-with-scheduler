@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from PIL import Image
-from heatmap import _color, render_heatmaps, GREEN, EMPTY
+from heatmap import _color, render_heatmaps, GREEN, LIGHT_GREEN, RED
 from logic import slot_keys
 
 
@@ -27,13 +27,13 @@ class HeatmapTests(unittest.TestCase):
         slot = slot_keys(record['config'],start,datetime.fromisoformat(record['poll_deadline']))[0]
         votes = [{'slot':slot,'user_id':u} for u in range(8)]
         pictures = render_heatmaps(record, votes, winner=slot)
-        self.assertEqual(len(pictures), 4)
-        self.assertEqual(len(set(name for name, _ in pictures)), 4)
+        self.assertEqual(len(pictures), 1)  # only the week with votes is shown
+        self.assertEqual(len(set(name for name, _ in pictures)), 1)
         for name, png in pictures:
             self.assertTrue(name.endswith('.png'))
             image = Image.open(BytesIO(png))
             self.assertEqual(image.format, 'PNG')
-            self.assertEqual(image.width, 970)
+            self.assertEqual(image.width, 850)
             self.assertGreater(image.height, 300)
             self.assertLess(len(png), 2_000_000)
 
@@ -44,8 +44,7 @@ class HeatmapTests(unittest.TestCase):
         vote = {'slot':slot,'user_id':9}
         self.assertEqual(render_heatmaps(record,[vote])[0][1],
                          render_heatmaps(record,[vote,vote,vote])[0][1])
-        self.assertNotEqual(render_heatmaps(record,[])[0][1],
-                            render_heatmaps(record,[vote])[0][1])
+        self.assertEqual(render_heatmaps(record,[]),[])
 
     def test_text_fallback_when_render_fails(self):
         src = (Path(__file__).resolve().parents[1]/'bot.py').read_text(encoding='utf-8')
@@ -64,10 +63,10 @@ class HeatmapTests(unittest.TestCase):
         self.assertEqual(files, [])
 
     def test_dynamic_legend_thresholds(self):
-        self.assertEqual(_color(0, 8), EMPTY)
-        self.assertEqual(_color(8, 8), GREEN)
-        self.assertNotEqual(_color(7, 8), GREEN)
-        self.assertEqual(_color(4, 4), GREEN)
+        self.assertEqual(_color(0), LIGHT_GREEN)
+        self.assertEqual(_color(2), LIGHT_GREEN)
+        self.assertEqual(_color(3), GREEN)
+        self.assertEqual(_color(2, True, False), RED)
 
     def test_bot_embeds_reference_distinct_uploaded_images(self):
         """Parse only the helper, so discord.py isn't needed in the unit test."""

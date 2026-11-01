@@ -17,7 +17,7 @@ class SchedulingTests(unittest.TestCase):
     def test_day_parser(self):
         self.assertEqual(parse_days("thur,fri,sat,sun"), [3,4,5,6])
         with self.assertRaises(ValueError): parse_days("fri,fri")
-        with self.assertRaises(ValueError): parse_days("monday,tue,wed,thu,fri")
+        with self.assertRaises(ValueError): parse_days("monday,tue,wed,thu,fri,sat,sun,monday")
 
     def test_time_parser(self):
         self.assertEqual(parse_times("2pm,4:15pm,6:30pm"), ["14:00", "16:15", "18:30"])

@@ -18,6 +18,8 @@ from logic import (choose_slot, event_datetimes, google_calendar_url, make_ics,
                    parse_days, parse_times, slot_keys)
 from storage import Store
 from heatmap import render_heatmaps
+from availability import ensure_schema, read_windows, carry_windows, windows_for_heatmap
+from availability_ui import AvailabilityVotePanel
 
 log = logging.getLogger("dnd_scheduler")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -63,8 +65,9 @@ def is_admin(user):
 
 def config_defaults(guild, creator_id, channel_id):
     return dict(title="Title", description="Description for event", dm_id=creator_id,
-                weeks=2, days=[3, 4, 5, 6], times=["14:00", "16:00", "18:00"],
-                poll_duration=3, attendee_limit=8, poll_after_event=3,
+                weeks=2, days=[6, 0, 1, 2, 3, 4, 5],
+                times=["14:00", "14:30", "15:00", "15:30", "16:00", "17:00", "18:00", "19:00"],
+                hours=8, poll_duration=3, attendee_limit=8, poll_after_event=3,
                 reminder_before_event=6, ping_role_id=guild.id,
                 event_duration=4, timezone=TZ_NAME, channel_id=None, looping=True)
 
@@ -72,8 +75,9 @@ def config_defaults(guild, creator_id, channel_id):
 def validate_config(c):
     for key, lo, hi in (("weeks", 1, 4), ("poll_duration", 3, 7),
                         ("poll_after_event", 3, 24), ("reminder_before_event", 3, 24),
-                        ("attendee_limit", 1, 99), ("event_duration", 1, 24)):
-        if not lo <= c[key] <= hi:
+                        ("attendee_limit", 1, 99), ("event_duration", 1, 24),
+                        ("hours", 1, 8)):
+        if not lo <= c.get(key, 8 if key == 'hours' else -1) <= hi:
             raise ValueError(f"{key} must be between {lo} and {hi}.")
     if not c["title"].strip() or len(c["title"]) > 100:
         raise ValueError("Title must be 1–100 characters.")
@@ -195,6 +199,41 @@ def build_visual_poll(record, votes, *, closed=False, winner=None):
     return [summary, *images], files
 
 
+def build_window_visual_poll(record, votes, windows, *, closed=False, winner=None):
+    """Short poll description; colored images only after availability was submitted."""
+    c = record['config']
+    legacy_windows, legacy_votes = windows_for_heatmap(windows, votes)
+    end = dtread(record['poll_deadline'])
+    label = 'CLOSED' if closed else 'VOTING OPEN'
+    description = (f"**{label}** · Deadline <t:{int(end.timestamp())}:F> "
+                   f"(<t:{int(end.timestamp())}:R>)\n"
+                   f"**DM:** <@{c['dm_id']}> · **Timezone:** `{c['timezone']}`\n"
+                   "Use **Set My Availability** to choose dates, start times, and hours.\n"
+                   "Light green: open · Green: popular · "
+                   "Red: outside the DM's available times.")
+    if winner:
+        description += (f"\n\n**Selected:** {slot_label(winner)}" if not is_test(c)
+                        else "\n\n**Test poll closed.**")
+    summary = discord.Embed(title=f"🗓️ {c['title']} — Availability",
+                            description=description, color=0x5865F2)
+    try:
+        charts = render_heatmaps(record, legacy_votes, windows=legacy_windows,
+                                 closed=closed, winner=winner)
+    except Exception:
+        log.exception('Heatmap render failed; retaining the text voting controls')
+        return [summary], []
+    if not charts:
+        summary.description += "\n\n*Heatmap appears after the first saved availability.*"
+    embeds = [summary]
+    uploads = []
+    for filename, content in charts:
+        embed = discord.Embed(color=0x2B2D31)
+        embed.set_image(url=f'attachment://{filename}')
+        embeds.append(embed)
+        uploads.append(discord.File(io.BytesIO(content), filename=filename))
+    return embeds, uploads
+
+
 def build_event_embed(record, rsvps):
     c = record["config"]
     start, end = dtread(record["event_start"]), dtread(record["event_end"])
@@ -241,7 +280,8 @@ class PollMessageView(discord.ui.View):
         if not slots:
             return await interaction.response.send_message("There are no future time slots in this poll.", ephemeral=True)
         saved = await self.bot.store.user_votes(self.guild_id, self.cycle, interaction.user.id)
-        panel = VotePanel(self.bot, record, interaction.user.id, slots, saved)
+        windows = await read_windows(self.bot.store, self.guild_id, self.cycle, interaction.user.id)
+        panel = AvailabilityVotePanel(self.bot, record, interaction.user.id, slots, windows, saved)
         await interaction.response.send_message(embed=panel.embed(), view=panel, ephemeral=True)
 
 
@@ -543,6 +583,7 @@ class SchedulerBot(commands.Bot):
         super().__init__(command_prefix="!unused-", intents=discord.Intents.default(),
                          allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=False))
         self.store = Store(DB_PATH)
+        ensure_schema(self.store)
         self.guild_locks = {}
         self._started_guilds = set()
         self._lifecycle_lock = asyncio.Lock()
@@ -741,7 +782,11 @@ class SchedulerBot(commands.Bot):
                 guild.id, record["cycle"] - 1, record["cycle"], self.slots_for(record))
         view = PollMessageView(self, guild.id, record["cycle"])
         votes = await self.store.votes(guild.id, record["cycle"])
-        embeds, files = build_visual_poll(record, votes)
+        if record["cycle"] > 1 and not is_test(record["config"]):
+            await carry_windows(self.store, guild.id, record["cycle"] - 1,
+                                record["cycle"], self.slots_for(record))
+        windows = await read_windows(self.store, guild.id, record["cycle"])
+        embeds, files = build_window_visual_poll(record, votes, windows)
         try:
             message = await channel.send(content=mention(record["config"], guild),
                                          embeds=embeds, files=files, view=view)
@@ -750,7 +795,7 @@ class SchedulerBot(commands.Bot):
                 raise
             log.exception("Could not upload heatmap; posting text-grid poll instead")
             message = await channel.send(content=mention(record["config"], guild),
-                                         embed=build_poll_embed(record, votes), view=view)
+                                         embed=embeds[0], view=view)
         await self.store.update(guild.id, state="poll", poll_message_id=message.id)
         log.info("Published poll guild=%s cycle=%s", guild.id, record["cycle"])
 
@@ -761,14 +806,15 @@ class SchedulerBot(commands.Bot):
             channel = self.get_channel(record["poll_channel_id"]) or await self.fetch_channel(record["poll_channel_id"])
             message = await channel.fetch_message(record["poll_message_id"])
             votes = await self.store.votes(guild_id, record["cycle"])
-            embeds, files = build_visual_poll(record, votes)
+            windows = await read_windows(self.store, guild_id, record["cycle"])
+            embeds, files = build_window_visual_poll(record, votes, windows)
             try:
                 # Replacing attachments on the original poll message means
                 # repeated votes do not spam the channel with new messages.
                 await message.edit(embeds=embeds, attachments=files)
             except discord.HTTPException:
                 log.exception("Heatmap update failed; falling back to text grid")
-                await message.edit(embed=build_poll_embed(record, votes), attachments=[])
+                await message.edit(embed=embeds[0], attachments=[])
         except discord.HTTPException:
             log.exception("Poll refresh failed")
 
@@ -781,13 +827,14 @@ class SchedulerBot(commands.Bot):
             try:
                 channel = self.get_channel(record["poll_channel_id"]) or await self.fetch_channel(record["poll_channel_id"])
                 msg = await channel.fetch_message(record["poll_message_id"])
-                embeds, files = build_visual_poll(record, votes, closed=True, winner=chosen)
+                windows = await read_windows(self.store, guild.id, record["cycle"])
+                embeds, files = build_window_visual_poll(record, votes, windows,
+                                                         closed=True, winner=chosen)
                 try:
                     await msg.edit(embeds=embeds, attachments=files, view=None)
                 except discord.HTTPException:
                     log.exception("Could not upload final heatmap; using text grid")
-                    await msg.edit(embed=build_poll_embed(record, votes, closed=True, winner=chosen),
-                                   attachments=[], view=None)
+                    await msg.edit(embed=embeds[0], attachments=[], view=None)
             except discord.HTTPException:
                 log.exception("Could not close poll message")
         if not chosen and not is_test(record["config"]):
@@ -1040,17 +1087,18 @@ async def scheduler_status(interaction: discord.Interaction):
     event_duration="Session duration in hours (1–24)")
 async def start_scheduler(interaction: discord.Interaction, title: str = "Title",
     description: str = "Description for event", dm: discord.Member | None = None,
-    weeks: int = 2, days: str = "thur,fri,sat,sun", times: str = "2pm,4pm,6pm",
+    weeks: int = 2, days: str = "", times: str = "",
     poll_duration: int = 3, attendee_limit: int = 8,
     poll_after_event: int = 3, reminder_before_event: int = 6,
-    ping_role: discord.Role | None = None, event_duration: int = 4):
+    ping_role: discord.Role | None = None, event_duration: int = 4,
+    hours: int = 8):
     if not await admin_gate(interaction): return
     await interaction.response.defer(ephemeral=True)
     try:
         c = config_defaults(interaction.guild, interaction.user.id, interaction.channel_id)
         c.update(title=title, description=description, dm_id=dm.id if dm else interaction.user.id,
                  weeks=weeks, days=parse_days(days), times=parse_times(times),
-                 poll_duration=poll_duration, attendee_limit=attendee_limit,
+                 hours=hours, poll_duration=poll_duration, attendee_limit=attendee_limit,
                  poll_after_event=poll_after_event, reminder_before_event=reminder_before_event,
                  ping_role_id=ping_role.id if ping_role else interaction.guild.id,
                  event_duration=event_duration, looping=True)

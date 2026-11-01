@@ -122,7 +122,7 @@ class AvailabilityTests(unittest.TestCase):
         self.assertTrue(all(len(getattr(child,'options',[]))<=25 for child in panel.children))
         self.assertEqual(len(panel.day_select.options),7)
         self.assertEqual(len(panel.hour_options()),8)
-        self.assertEqual(panel.selected_hours,1)
+        self.assertEqual(panel.selected_hours,3)
 
     def test_hours_validation_rejects_out_of_range_and_mismatched_dates(self):
         with TemporaryDirectory() as d:

@@ -63,16 +63,30 @@ class Store:
 
 class OnceTests(unittest.TestCase):
     def test_poll_start_and_no_mass_pings(self):
-        is_test, poll_start, mention, event_title = funcs(
-            'is_test', 'poll_start', 'mention', 'event_title',
-            dtread=datetime.fromisoformat, timedelta=timedelta)
+        is_test, poll_start, players_mention, mention, event_title = funcs(
+            'is_test', 'poll_start', 'players_mention', 'mention', 'event_title',
+            dtread=datetime.fromisoformat, timedelta=timedelta,
+            log=SimpleNamespace(warning=lambda *args: None))
         deadline = NOW + timedelta(minutes=1)
         test_cfg = {'test_mode': True, 'poll_duration': 3, 'title': 'Test Poll', 'ping_role_id': None}
         regular_cfg = {'poll_duration': 3, 'title': 'Campaign', 'ping_role_id': 123}
         self.assertEqual(poll_start({'config': test_cfg, 'poll_deadline': deadline.isoformat()}), NOW)
         self.assertEqual(poll_start({'config': regular_cfg, 'poll_deadline': deadline.isoformat()}), deadline - timedelta(days=3))
         self.assertEqual(mention(test_cfg, SimpleNamespace(id=987)), '')
-        self.assertEqual(mention(regular_cfg, SimpleNamespace(id=987)), '<@&123>')
+        guild = SimpleNamespace(
+            id=987,
+            roles=[
+                SimpleNamespace(
+                    id=123,
+                    name='Players',
+                    mention='<@&123>'
+                )
+            ]
+        )
+
+        self.assertEqual(mention(regular_cfg, guild), '<@&123>')
+        self.assertEqual(mention({'ping_role_id': 987}, guild), '<@&123>')
+        self.assertEqual(mention(regular_cfg, SimpleNamespace(id=987, roles=[])), '')
         self.assertEqual(event_title(test_cfg), 'Test Event')
         self.assertEqual(event_title(regular_cfg), 'Campaign')
 

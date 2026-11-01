@@ -75,9 +75,10 @@ def slot_keys(config: dict, now: datetime, poll_end: datetime) -> list[str]:
 
 
 def choose_slot(votes: list[dict], valid_slots: list[str], dm_id: int, rng=None,
-                attendee_limit: int = 8) -> tuple[str | None, list[int]]:
-    """Earliest qualified slot wins if it has >= attendee_limit distinct voters.
+                attendee_limit: int = 8, min_votes: int = 1) -> tuple[str | None, list[int]]:
+    """Require minimum distinct people per date before choosing a session.
 
+    Earliest exact slot with >= attendee_limit wins among qualifying dates.
     DM-voted days remain a constraint. With no qualified slot, use the original
     popular-day, then popular-time method (random tie-breaks). A person voting
     for multiple times on one date is counted only once for the day tally.
@@ -95,6 +96,10 @@ def choose_slot(votes: list[dict], valid_slots: list[str], dm_id: int, rng=None,
         slot_voters[vote["slot"]].add(vote["user_id"])
     dm_days = {vote["slot"][:10] for vote in filtered if vote["user_id"] == dm_id}
     eligible_days = dm_days if dm_days else set(day_voters)
+    # A user selecting multiple times on a date is only one voter on that date.
+    eligible_days = {day for day in eligible_days if len(day_voters[day]) >= min_votes}
+    if not eligible_days:
+        return None, []
     qualified = sorted(slot for slot, users in slot_voters.items()
                        if slot[:10] in eligible_days and len(users) >= attendee_limit)
     if qualified:

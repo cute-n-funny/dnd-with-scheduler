@@ -134,24 +134,24 @@ class OnceTests(unittest.TestCase):
             self.assertEqual(store.rsvps, [])
         asyncio.run(check())
 
-    def test_regular_poll_without_votes_still_repolls(self):
+    def test_regular_poll_without_votes_schedules_delayed_retry(self):
         (close_poll,) = funcs('close_poll', methods=True, utcnow=lambda: NOW,
                              timedelta=timedelta, choose_slot=choose_slot,
                              event_datetimes=lambda slot, cfg: (NOW + timedelta(days=8), NOW + timedelta(days=8, hours=4)),
                              is_test=lambda c: c.get('test_mode', False),
                              dtread=datetime.fromisoformat, log=SimpleNamespace(info=lambda *args: None))
         async def check():
-            cfg = {'dm_id': 11, 'attendee_limit': 12}
+            cfg = {'dm_id': 11, 'attendee_limit': 12, 'poll_duration': 3}
             record = {'config': cfg, 'cycle': 1, 'poll_message_id': None, 'guild_id': 55}
             store = Store(record)
-            made = []
             class Bot:
                 def __init__(self): self.store = store
                 def slots_for(self, record): return [SLOT]
-                async def prepare_poll(self, guild, config, cycle): made.append(('new_poll', cycle))
-                async def publish_poll(self, guild, record): made.append(('publish', record['cycle']))
+                async def prepare_poll(self, guild, config, cycle):
+                    raise AssertionError('Retry must not happen immediately')
             await close_poll(Bot(), SimpleNamespace(id=55), record)
-            self.assertEqual(made, [('new_poll', 2), ('publish', 1)])
+            self.assertEqual(record['state'], 'waiting_retry')
+            self.assertEqual(datetime.fromisoformat(record['next_poll_at']), NOW + timedelta(hours=36))
         asyncio.run(check())
 
     def test_test_command_does_not_ping_or_loop_and_saves_normal_config(self):

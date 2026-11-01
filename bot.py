@@ -103,17 +103,18 @@ def config_defaults(guild, creator_id, channel_id):
     return dict(title="Title", description="Description for event", dm_id=creator_id,
                 weeks=2, days=[6, 0, 1, 2, 3, 4, 5],
                 times=["14:00", "14:30", "15:00", "15:30", "16:00", "17:00", "18:00", "19:00"],
-                hours=8, poll_duration=3, attendee_limit=8, poll_after_event=3,
+                hours=8, poll_duration=2, min_votes=3, attendee_limit=8, poll_after_event=3,
                 reminder_before_event=6, ping_role_id=guild.id,
                 event_duration=4, timezone=TZ_NAME, channel_id=None, looping=True)
 
 
 def validate_config(c):
-    for key, lo, hi in (("weeks", 1, 4), ("poll_duration", 3, 7),
+    for key, lo, hi in (("weeks", 1, 4), ("poll_duration", 2, 6),
                         ("poll_after_event", 3, 24), ("reminder_before_event", 3, 24),
                         ("attendee_limit", 1, 99), ("event_duration", 1, 24),
-                        ("hours", 3, 8)):
-        if not lo <= c.get(key, 8 if key == 'hours' else -1) <= hi:
+                        ("hours", 3, 8), ("min_votes", 3, 12)):
+        default = 8 if key == 'hours' else 3 if key == 'min_votes' else -1
+        if not lo <= c.get(key, default) <= hi:
             raise ValueError(f"{key} must be between {lo} and {hi}.")
     if not c["title"].strip() or len(c["title"]) > 100:
         raise ValueError("Title must be 1–100 characters.")
@@ -857,8 +858,12 @@ class SchedulerBot(commands.Bot):
     async def close_poll(self, guild, record):
         votes = await self.store.votes(guild.id, record["cycle"])
         slots = [s for s in self.slots_for(record) if event_datetimes(s, record["config"])[0] > utcnow() + timedelta(minutes=5)]
+        # min_votes is distinct people on a calendar DATE, not raw slots/clicks.
+        # Test mode bypasses the minimum, preserving its one-vote/zero-vote smoke tests.
+        minimum = 1 if is_test(record["config"]) else record["config"].get("min_votes", 3)
         chosen, users = choose_slot(votes, slots, record["config"]["dm_id"],
-                                    attendee_limit=record["config"]["attendee_limit"])
+                                    attendee_limit=record["config"]["attendee_limit"],
+                                    min_votes=minimum)
         if record["poll_message_id"]:
             try:
                 channel = self.get_channel(record["poll_channel_id"]) or await self.fetch_channel(record["poll_channel_id"])
@@ -874,9 +879,13 @@ class SchedulerBot(commands.Bot):
             except discord.HTTPException:
                 log.exception("Could not close poll message")
         if not chosen and not is_test(record["config"]):
-            log.info("No valid votes in guild %s; starting another poll", guild.id)
-            await self.prepare_poll(guild, record["config"], record["cycle"] + 1)
-            await self.publish_poll(guild, await self.store.get(guild.id))
+            # No event: persist the retry deadline so Fly restarts do not
+            # shorten the cooldown or create duplicate polls.
+            delay = timedelta(hours=12 * record["config"]["poll_duration"])
+            next_at = utcnow() + delay
+            log.info("No eligible date in guild %s; retrying poll at %s", guild.id, next_at)
+            await self.store.update(guild.id, state="waiting_retry",
+                                    next_poll_at=next_at.isoformat(), selected_slot=None)
             return
         if is_test(record["config"]):
             # The test is a quick smoke-test of the event pipeline. Poll choices
@@ -1019,7 +1028,7 @@ class SchedulerBot(commands.Bot):
                                 await self.store.update(guild.id, state="waiting", next_poll_at=next_at.isoformat())
                             else:
                                 await self.store.update(guild.id, state="finished")
-                    elif r["state"] == "waiting" and now >= dtread(r["next_poll_at"]):
+                    elif r["state"] in ("waiting", "waiting_retry") and now >= dtread(r["next_poll_at"]):
                         await self.prepare_poll(guild, r["config"], r["cycle"] + 1)
                         await self.publish_poll(guild, await self.store.get(guild.id))
                 except Exception:
@@ -1060,7 +1069,8 @@ def build_scheduler_status(record, votes, rsvps):
     status = {
         "poll_preparing": "Preparing poll", "poll": "Accepting votes",
         "creating_event": "Creating event", "event": "Session scheduled",
-        "waiting": "Waiting for next poll", "finished": "Finished (no repeat)"
+        "waiting": "Waiting for next poll", "waiting_retry": "Waiting to retry after insufficient votes",
+        "finished": "Finished (no repeat)"
     }.get(phase, phase)
     desc = (f"**Campaign:** {event_title(c)}\n"
             f"**Mode:** {'One-minute test' if is_test(c) else 'Recurring' if c.get('looping') else 'One time'}\n"
@@ -1086,8 +1096,11 @@ def build_scheduler_status(record, votes, rsvps):
             desc += f"**Reminder:** <t:{int(reminder.timestamp())}:R>\n"
         desc += "**Next action:** Start/end the scheduled event; then " + (
             "open another poll." if c["looping"] else "stop.")
-    elif phase == "waiting" and record.get("next_poll_at"):
+    elif phase in ("waiting", "waiting_retry") and record.get("next_poll_at"):
         next_at = dtread(record["next_poll_at"])
+        if phase == "waiting_retry":
+            desc += (f"**Outcome:** No eligible date reached the minimum of "
+                     f"{c.get('min_votes', 3)} distinct voters (or no valid slot remained).\n")
         desc += f"**Next action:** New poll <t:{int(next_at.timestamp())}:R> (<t:{int(next_at.timestamp())}:F>)"
     elif phase == "finished":
         desc += "**Next action:** None. Use `/reset_scheduler` or `/start_scheduler` to resume."
@@ -1118,8 +1131,9 @@ async def scheduler_status(interaction: discord.Interaction):
     dm="DM whose voted days have priority", weeks="Number of upcoming weeks (1–4)",
     days="Comma-separated weekdays (e.g. thur,fri,sat,sun)",
     times="Comma-separated times (e.g. 2pm,4:15pm,6:30pm)",
-    poll_duration="Days the availability poll stays open (3–7)",
+    poll_duration="Days the availability poll stays open (2–6; default 2)",
     attendee_limit="Maximum number of confirmed attendees (1–99)",
+    min_votes="Minimum distinct voters on a date (3–12; default 3)",
     poll_after_event="Hours after the event ends before next poll (3–24)",
     reminder_before_event="Hours before session START to remind players (3–24)",
     ping_role="Optional poll/reminder role (default Players; events always ping Players)",
@@ -1128,10 +1142,10 @@ async def scheduler_status(interaction: discord.Interaction):
 async def start_scheduler(interaction: discord.Interaction, title: str = "Title",
     description: str = "Description for event", dm: discord.Member | None = None,
     weeks: int = 2, days: str = "", times: str = "",
-    poll_duration: int = 3, attendee_limit: int = 8,
+    poll_duration: int = 2, attendee_limit: int = 8,
     poll_after_event: int = 3, reminder_before_event: int = 6,
     ping_role: discord.Role | None = None, event_duration: int = 4,
-    hours: int = 8):
+    hours: int = 8, min_votes: int = 3):
     if not await admin_gate(interaction): return
     await interaction.response.defer(ephemeral=True)
     try:
@@ -1139,6 +1153,7 @@ async def start_scheduler(interaction: discord.Interaction, title: str = "Title"
         c.update(title=title, description=description, dm_id=dm.id if dm else interaction.user.id,
                  weeks=weeks, days=parse_days(days), times=parse_times(times),
                  hours=hours, poll_duration=poll_duration, attendee_limit=attendee_limit,
+                 min_votes=min_votes,
                  poll_after_event=poll_after_event, reminder_before_event=reminder_before_event,
                  ping_role_id=ping_role.id if ping_role else interaction.guild.id,
                  event_duration=event_duration, looping=True)
@@ -1192,6 +1207,10 @@ async def test_scheduler(interaction: discord.Interaction):
         normal_config = (dict(previous) if previous else
                          config_defaults(interaction.guild, interaction.user.id, interaction.channel_id))
         c = dict(normal_config)
+        # Older saved campaigns may have a now-invalid seven-day poll. Keep the
+        # original settings for a later reset but normalize the test copy.
+        if not 2 <= c.get("poll_duration", 2) <= 6:
+            c["poll_duration"] = 2
         c.update(title="Test Poll", description="One-minute automated scheduler test.",
                  dm_id=interaction.user.id, test_mode=True, looping=False,
                  ping_role_id=None, previous_normal_config=normal_config)

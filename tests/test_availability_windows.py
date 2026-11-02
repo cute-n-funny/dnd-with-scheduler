@@ -11,7 +11,7 @@ import unittest
 
 from PIL import Image
 from availability import ensure_schema, read_windows, save_windows, carry_windows, _qualifying_slots
-from heatmap import _color, _week_start, LIGHT_GREEN, GREEN, RED, render_heatmaps
+from heatmap import _color, _week_start, LIGHT_GREEN, GREEN, RED, ORANGE, render_heatmaps
 from logic import parse_days, parse_times
 
 
@@ -87,7 +87,7 @@ class AvailabilityTests(unittest.TestCase):
         self.assertEqual(_color(3),GREEN)
         self.assertEqual(_color(8),GREEN)
         self.assertEqual(_color(0,True,False),RED)
-        self.assertEqual(_color(12,True,False),RED)
+        self.assertEqual(_color(12,True,False),ORANGE)
         self.assertEqual(_color(2,True,True),LIGHT_GREEN)
 
     def test_four_week_discord_ui_uses_valid_component_rows(self):

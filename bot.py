@@ -113,7 +113,7 @@ def config_defaults(guild, creator_id, channel_id):
                        "17:00", "17:30", "18:00", "18:30", "19:00"],
                 hours=8, poll_duration=2, min_votes=3, attendee_limit=8, poll_after_event=3,
                 reminder_before_event=6, ping_role_id=guild.id,
-                event_duration=4, timezone=TZ_NAME, channel_id=None, looping=True)
+                event_duration=4, timezone=TZ_NAME, channel_id=None, location="", looping=True)
 
 
 def validate_config(c):
@@ -128,6 +128,8 @@ def validate_config(c):
         raise ValueError("Title must be 1–100 characters.")
     if len(c["description"]) > 900:
         raise ValueError("Description cannot exceed 900 characters.")
+    if not isinstance(c.get("location", ""), str) or len(c.get("location", "")) > 100:
+        raise ValueError("Location must be text of at most 100 characters.")
     try:
         ZoneInfo(c["timezone"])
     except ZoneInfoNotFoundError as exc:
@@ -173,6 +175,8 @@ def build_poll_embed(record, votes, *, closed=False, winner=None):
                      f"**DM:** <@{c['dm_id']}> · **Minimum to win:** {c['attendee_limit']} voters at the same time · "
                      f"**Timezone:** `{c['timezone']}`"
                      f"{test_note}\n\n{instructions}"))
+    if c.get("location", "").strip():
+        embed.add_field(name="📍 Location", value=c["location"].strip(), inline=False)
     if winner:
         if is_test(c):
             detail = f"Top test vote: {slot_label(winner)} (not the actual test event time)"
@@ -254,8 +258,10 @@ def build_window_visual_poll(record, votes, windows, *, closed=False, winner=Non
                    f"(<t:{int(end.timestamp())}:R>)\n"
                    f"**DM:** <@{c['dm_id']}> · **Timezone:** `{c['timezone']}`\n"
                    "Use **Set My Availability** to choose dates, start times, and hours.\n"
-                   "Light green: open · Green: popular · "
-                   "Red: outside the DM's available times.")
+                   "Light green: 0–2 · Green: 3+ · Red: DM unavailable without votes · "
+                   "Orange: votes outside DM availability.")
+    if c.get("location", "").strip():
+        description += f"\n📍 **Location:** {c['location'].strip()}"
     if winner:
         description += (f"\n\n**Selected:** {slot_label(winner)}" if not is_test(c)
                         else "\n\n**Test poll closed.**")
@@ -293,6 +299,8 @@ def build_event_embed(record, rsvps):
             "Use **Manage My RSVP** below to view your personal status, join, or cancel. "
             "When a confirmed spot opens, the earliest waitlisted player moves up.\n"
             "*Bot-managed RSVPs are separate from Discord Event Interested.*")
+    if c.get("location", "").strip():
+        desc += f"\n📍 **Location:** {c['location'].strip()}"
     if record["discord_event_id"]:
         desc += f"\n**Discord Event:** {event_link(record['guild_id'], record['discord_event_id'])}"
     if record["forum_thread_id"]:
@@ -931,8 +939,9 @@ class SchedulerBot(commands.Bot):
                     params["channel"] = voice
                 else:
                     params["entity_type"] = discord.EntityType.external
-                    params["location"] = ("Discord — test session" if is_test(c)
-                                          else "Discord — see session forum post")
+                    params["location"] = (c.get("location", "").strip() or
+                                          ("Discord — test session" if is_test(c)
+                                           else "Discord — see session forum post"))
                 event = await guild.create_scheduled_event(**params)
                 event_id = event.id
             await self.store.update(guild.id, discord_event_id=event_id)
@@ -1148,14 +1157,15 @@ async def scheduler_status(interaction: discord.Interaction):
     reminder_before_event="Hours before session START to remind players (3–24)",
     ping_role="Optional poll/reminder role (default Players; events always ping Players)",
     event_duration="Session duration in hours (1–24)",
-    hours="Maximum availability duration in hours (3–8; 1-hour steps)")
+    hours="Maximum availability duration in hours (3–8; 1-hour steps)",
+    location="Optional physical or online session location (default blank)")
 async def start_scheduler(interaction: discord.Interaction, title: str = "Title",
     description: str = "Description for event", dm: discord.Member | None = None,
     weeks: int = 2, days: str = "", times: str = "",
     poll_duration: int = 2, attendee_limit: int = 8,
     poll_after_event: int = 3, reminder_before_event: int = 6,
     ping_role: discord.Role | None = None, event_duration: int = 4,
-    hours: int = 8, min_votes: int = 3):
+    hours: int = 8, min_votes: int = 3, location: str = ""):
     if not await admin_gate(interaction): return
     await interaction.response.defer(ephemeral=True)
     try:
@@ -1166,7 +1176,7 @@ async def start_scheduler(interaction: discord.Interaction, title: str = "Title"
                  min_votes=min_votes,
                  poll_after_event=poll_after_event, reminder_before_event=reminder_before_event,
                  ping_role_id=ping_role.id if ping_role else interaction.guild.id,
-                 event_duration=event_duration, looping=True)
+                 event_duration=event_duration, location=location.strip(), looping=True)
         await bot.replace_scheduler(interaction.guild, c)
         await interaction.followup.send("✅ Recurring scheduler started! See the public voting channel for the poll.", ephemeral=True)
     except (ValueError, discord.HTTPException) as exc:

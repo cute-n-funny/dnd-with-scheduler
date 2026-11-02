@@ -14,7 +14,8 @@ PANEL = '#242b33'
 EMPTY = '#35404a'
 LIGHT_GREEN = '#a6df91'  # 0-2 voters, including polls before first vote
 GREEN = '#28b567'        # 3+ distinct voters
-RED = '#d95761'          # DM has voted, but is not available at this time
+RED = '#d95761'          # DM has voted but has no availability here
+ORANGE = '#e7954e'       # Others voted, but DM is not available here
 TEXT = '#f1f4f7'
 MUTED = '#b5bdc8'
 
@@ -27,8 +28,9 @@ def _font(size, bold=False):
 
 
 def _color(count, dm_has_voted=False, dm_available=True):
+    # Precedence: orange > red > green > light green.
     if dm_has_voted and not dm_available:
-        return RED
+        return ORANGE if count > 0 else RED
     return GREEN if count >= 3 else LIGHT_GREEN
 
 
@@ -83,7 +85,8 @@ def render_heatmaps(record, votes, *, windows=None, closed=False, winner=None):
         image = Image.new('RGB', (width,height), BACKGROUND)
         d = ImageDraw.Draw(image)
         d.rounded_rectangle((9,9,width-9,height-9),radius=14,fill=PANEL)
-        d.text((26,23), f"Group availability · {first:%b %d}–{first+timedelta(days=6):%b %d}",
+        last = first + timedelta(days=6)
+        d.text((26,23), f"Group start availability - {first:%b %d}-{last:%b %d}",
                fill=TEXT,font=title_font)
         d.text((26,60), c['timezone'],fill=MUTED,font=small)
         d.text((width-26,61),'CLOSED' if closed else 'LIVE', fill=MUTED,font=small,anchor='ra')
@@ -110,7 +113,8 @@ def render_heatmaps(record, votes, *, windows=None, closed=False, winner=None):
                 d.rounded_rectangle(rect,radius=4,fill=color)
                 if winner==slot:
                     d.rounded_rectangle(rect,radius=4,outline=TEXT,width=3)
-        d.text((27,height-30),'Light green: open  ·  Green: popular  ·  Red: outside DM availability',
+        d.text((27,height-30),
+               'Light green: 0-2  ·  Green: 3+  ·  Red: DM unavailable  ·  Orange: votes, DM unavailable',
                fill=MUTED,font=small)
         buff=BytesIO()
         image.save(buff,'PNG',optimize=True)

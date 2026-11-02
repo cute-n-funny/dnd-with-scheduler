@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from PIL import Image
-from heatmap import _color, render_heatmaps, GREEN, LIGHT_GREEN, RED
+from heatmap import _color, render_heatmaps, GREEN, LIGHT_GREEN, RED, ORANGE
 from logic import slot_keys
 
 
@@ -66,7 +66,10 @@ class HeatmapTests(unittest.TestCase):
         self.assertEqual(_color(0), LIGHT_GREEN)
         self.assertEqual(_color(2), LIGHT_GREEN)
         self.assertEqual(_color(3), GREEN)
-        self.assertEqual(_color(2, True, False), RED)
+        self.assertEqual(_color(0, True, False), RED)
+        self.assertEqual(_color(2, True, False), ORANGE)
+        self.assertEqual(_color(12, True, False), ORANGE)
+        self.assertEqual(_color(3, True, True), GREEN)
 
     def test_bot_embeds_reference_distinct_uploaded_images(self):
         """Parse only the helper, so discord.py isn't needed in the unit test."""

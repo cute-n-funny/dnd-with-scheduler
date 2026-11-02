@@ -104,10 +104,7 @@ class AvailabilityVotePanel(discord.ui.View):
                 'and how many **hours** you can stay. **Add Times** and '
                 '**Remove Times** save immediately. Press **Close** when finished.\n\n'
                 f'**Start:** {", ".join(_label(t) for t in sorted(self.target_starts)) or "Choose a time"}\n'
-                f'**Duration:** {self.selected_hours} hours\n'
-                f'**Timezone:** `{self.config["timezone"]}`\n'
-                f'**Event duration:** {self.config["event_duration"]} hours '
-                '(only windows covering the entire event count toward scheduling).\n\n'
+                f'**Timezone:** `{self.config["timezone"]}`\n\n'
                 f'**Saved availability ({len(self.selected)}):**\n{text}\n\n{note}'))
 
     async def choose_week(self,interaction):

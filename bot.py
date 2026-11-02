@@ -121,7 +121,7 @@ def validate_config(c):
     for key, lo, hi in (("weeks", 1, 4), ("poll_duration", 2, 6),
                         ("poll_after_event", 3, 24), ("reminder_before_event", 3, 24),
                         ("attendee_limit", 1, 99), ("event_duration", 1, 24),
-                        ("hours", 3, 8), ("min_votes", 3, 12)):
+                        ("hours", 4, 8), ("min_votes", 3, 12)):
         default = 8 if key == 'hours' else 3 if key == 'min_votes' else -1
         if not lo <= c.get(key, default) <= hi:
             raise ValueError(f"{key} must be between {lo} and {hi}.")
@@ -1165,7 +1165,7 @@ async def scheduler_status(interaction: discord.Interaction):
     reminder_before_event="Hours before session START to remind players (3–24)",
     ping_role="Optional poll/reminder role (default Players; events always ping Players)",
     event_duration="Session duration in hours (1–24)",
-    hours="Maximum availability duration in hours (3–8; 1-hour steps)",
+    hours="Maximum availability duration in hours (4–8; 1-hour steps)",
     location="Optional physical or online session location (default blank)")
 async def start_scheduler(interaction: discord.Interaction, title: str = "Title",
     description: str = "Description for event", dm: discord.Member | None = None,
@@ -1204,6 +1204,8 @@ async def reset_scheduler(interaction: discord.Interaction):
         if previous and is_test(previous):
             previous = previous.get("previous_normal_config")
         c = dict(previous) if previous else config_defaults(interaction.guild, interaction.user.id, interaction.channel_id)
+        # Legacy campaigns with a three-hour maximum can still be reset.
+        c["hours"] = max(4, c.get("hours", 8))
         c["looping"] = True
         c["test_mode"] = False
         await bot.replace_scheduler(interaction.guild, c)
@@ -1239,6 +1241,7 @@ async def test_scheduler(interaction: discord.Interaction):
         # original settings for a later reset but normalize the test copy.
         if not 2 <= c.get("poll_duration", 2) <= 6:
             c["poll_duration"] = 2
+        c["hours"] = max(4, c.get("hours", 8))
         c.update(title="Test Poll", description="One-minute automated scheduler test.",
                  dm_id=interaction.user.id, test_mode=True, looping=False,
                  ping_role_id=None, previous_normal_config=normal_config)

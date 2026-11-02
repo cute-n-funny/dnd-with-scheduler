@@ -29,9 +29,10 @@ class AvailabilityVotePanel(discord.ui.View):
         self.week=self.weeks[0]
         self.target_days=set()
         self.target_starts=set()
-        # The hours limit controls the *largest* choice, not the initial choice.
-        self.max_hours=max(3,min(8,int(self.config.get('hours',8))))
-        self.selected_hours=3
+        # The configured maximum ranges from 4–8; the selected duration starts at four.
+        # Legacy schedules with a maximum of three are displayed with at least four.
+        self.max_hours=max(4,min(8,int(self.config.get('hours',8))))
+        self.selected_hours=4
         # Legacy per-slot ballots can be reopened and edited without disappearing.
         previous={(w['day'],w['start']):int(w['hours']) for w in saved_windows}
         if not previous:
@@ -81,7 +82,8 @@ class AvailabilityVotePanel(discord.ui.View):
                 for t in self.times]
 
     def hour_options(self):
-        return [discord.SelectOption(label=f'{h} hour'+('' if h==1 else 's'),
+        return [discord.SelectOption(
+            label='Default (4 hours)' if h == 4 else f'{h} hour'+('' if h==1 else 's'),
             value=str(h),default=h==self.selected_hours)
             for h in range(1,self.max_hours+1)]
 

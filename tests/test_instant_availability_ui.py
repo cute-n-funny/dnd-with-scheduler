@@ -151,7 +151,7 @@ class PanelTests(unittest.TestCase):
         return ui.AvailabilityVotePanel(self.bot,self.record,9,self.slots,
                                         saved_windows or [],[])
 
-    def test_scheduler_hours_configuration_is_3_to_8(self):
+    def test_scheduler_hours_configuration_is_4_to_8(self):
         """Validate the real bot's config checker without importing discord.py."""
         import ast
         from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -164,11 +164,11 @@ class PanelTests(unittest.TestCase):
         config={'weeks':2,'poll_duration':3,'poll_after_event':3,
                 'reminder_before_event':6,'attendee_limit':8,'event_duration':4,
                 'title':'Title','description':'Description','timezone':'America/Chicago',
-                'hours':3}
+                'hours':4}
         ns['validate_config'](config)
         config['hours']=8
         ns['validate_config'](config)
-        for wrong in (1,2,9):
+        for wrong in (1,2,3,9):
             config['hours']=wrong
             with self.assertRaises(ValueError):
                 ns['validate_config'](config)
@@ -185,19 +185,23 @@ class PanelTests(unittest.TestCase):
             self.assertEqual([x.style for x in panel.children[4:]], [3,4,2])
             self.assertEqual(panel.target_days,set())
             self.assertFalse(any(opt.default for opt in panel.day_select.options))
-            self.assertEqual(panel.selected_hours,3)
+            self.assertEqual(panel.selected_hours,4)
             self.assertEqual([int(o.value) for o in panel.hours_select.options],list(range(1,9)))
-            self.assertEqual([o.value for o in panel.hours_select.options if o.default],['3'])
+            self.assertEqual([o.value for o in panel.hours_select.options if o.default],['4'])
+            self.assertEqual(next(o.label for o in panel.hours_select.options if o.value == '4'),
+                             'Default (4 hours)')
             self.assertNotIn('Press **Save**',panel.embed().description)
 
     def test_hours_options_one_to_configured_maximum(self):
         with mocked_discord() as ui:
-            for maximum in range(3,9):
+            for maximum in range(4,9):
                 self.record['config']['hours']=maximum
                 panel = self.make_panel(ui)
                 self.assertEqual([int(o.value) for o in panel.hours_select.options],
                                  list(range(1,maximum+1)))
-                self.assertEqual(panel.selected_hours,3)
+                self.assertEqual(panel.selected_hours,4)
+                self.assertEqual(next(o.label for o in panel.hours_select.options if o.value == '4'),
+                                 'Default (4 hours)')
 
     def test_week_switch_clears_dates(self):
         with mocked_discord() as ui:
@@ -224,8 +228,12 @@ class PanelTests(unittest.TestCase):
             self.assertEqual(self.bot.refreshed,1)
             windows=asyncio.run(read_windows(self.store,4,1,9))
             self.assertEqual(len(windows),2)
-            self.assertEqual([w['hours'] for w in windows],[3,3])
-            # 3-hour windows cannot qualify as a four-hour event.
+            self.assertEqual([w['hours'] for w in windows],[4,4])
+            # The new four-hour default qualifies for a four-hour session.
+            self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM votes').fetchone()[0],2)
+            panel.hours_select.values=['3']
+            asyncio.run(panel.choose_hours(FakeInteraction()))
+            asyncio.run(panel.add_windows(FakeInteraction()))
             self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM votes').fetchone()[0],0)
             panel.hours_select.values=['4']
             asyncio.run(panel.choose_hours(FakeInteraction()))
@@ -235,7 +243,7 @@ class PanelTests(unittest.TestCase):
             asyncio.run(panel.remove_windows(FakeInteraction()))
             self.assertEqual(asyncio.run(read_windows(self.store,4,1,9)),[])
             self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM votes').fetchone()[0],0)
-            self.assertEqual(self.bot.refreshed,3)
+            self.assertEqual(self.bot.refreshed,4)
 
     def test_other_panel_edits_not_erased(self):
         from availability import read_windows

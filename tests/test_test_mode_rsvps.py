@@ -37,8 +37,10 @@ def announcement_from_source():
     source = ast.parse((Path(__file__).resolve().parents[1] / 'bot.py').read_text(encoding='utf-8'))
     node = copy.deepcopy(next(node for node in source.body if isinstance(node, ast.FunctionDef)
                               and node.name == 'session_announcement'))
+    # The announcement now calls the configured-role resolver, not an
+    # automatic Players-role lookup. Test mode must always resolve to no ping.
     ns = {'is_test': lambda c: bool(c.get('test_mode')),
-          'players_mention': lambda guild: '<@&900>'}
+          'mention': lambda config, guild: ''}
     exec(compile(ast.Module(body=[node], type_ignores=[]), 'bot.py', 'exec'), ns)
     return ns['session_announcement']
 

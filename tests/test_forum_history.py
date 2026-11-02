@@ -102,7 +102,9 @@ class ForumHistoryTests(unittest.TestCase):
         self.assertEqual(bot.message_deletions, [10,11])
         self.assertEqual(store.deleted, [42])
 
-    def test_test_scheduler_does_not_require_forum_channel(self):
+    def test_test_scheduler_requires_configured_forum_but_posts_no_thread(self):
+        # Every scheduler command now requires valid per-server forum settings.
+        # The test still skips *creating* forum threads in create_event().
         replace = get_function('replace_scheduler', method=True,
             is_test=lambda cfg:cfg.get('test_mode',False),
             validate_config=lambda cfg:None,
@@ -115,7 +117,7 @@ class ForumHistoryTests(unittest.TestCase):
                 self.actions=[]
             def lock_for(self, guild_id):return self.lock
             def text_channel(self,guild,config):return SimpleNamespace(id=901)
-            def forum_channel(self,guild):return None
+            def forum_channel(self,guild):return SimpleNamespace(id=902)
             def slots_for(self,record):return ['2026-12-10T14:00']
             async def cleanup(self,guild):self.actions.append('cleanup')
             async def prepare_poll(self,guild,config,cycle):self.actions.append('prepare')
@@ -134,8 +136,11 @@ class ForumHistoryTests(unittest.TestCase):
             def lock_for(self,guild_id):return self.lock
             def text_channel(self,guild,config):return SimpleNamespace(id=901)
             def forum_channel(self,guild):return None
-        with self.assertRaisesRegex(ValueError, 'Forum channel'):
+        with self.assertRaisesRegex(ValueError, 'channel-for-forum is not set'):
             asyncio.run(replace(Bot(),SimpleNamespace(id=42),dict(test_mode=False)))
+        # The same required preference applies to the one-minute test command.
+        with self.assertRaisesRegex(ValueError, 'channel-for-forum is not set'):
+            asyncio.run(replace(Bot(),SimpleNamespace(id=42),dict(test_mode=True)))
 
     def make_create_event(self):
         fake_discord=SimpleNamespace(
@@ -162,6 +167,10 @@ class ForumHistoryTests(unittest.TestCase):
             def __init__(self):
                 self.store=store
                 self.user=SimpleNamespace(id=555)
+                self.native_events_enabled=True
+            def preferences_for(self,guild):
+                return {'activate_discord_events': self.native_events_enabled}
+            def role_config(self,guild,config):return config
             def voice_channel(self,guild):return None
             def forum_channel(self,guild):
                 if test_mode:
@@ -205,6 +214,20 @@ class ForumHistoryTests(unittest.TestCase):
         self.assertEqual(record['forum_thread_id'],777)
         self.assertEqual(len(announcements),1)
         self.assertEqual(guild.params[0]['location'],'Discord — see session forum post')
+
+    def test_real_event_with_native_events_disabled_still_posts_forum(self):
+        # Native Discord events default off, but bot RSVPs and forum posts remain.
+        record=self.base_record(False)
+        guild=DummyGuild()
+        bot,posts,announcements=self.make_bot(guild,record,False)
+        bot.native_events_enabled=False
+        asyncio.run(self.make_create_event()(bot,guild,record))
+        self.assertEqual(guild.params,[])
+        self.assertIsNone(record['discord_event_id'])
+        self.assertEqual(record['forum_thread_id'],777)
+        self.assertEqual(len(posts),1)
+        self.assertNotIn('Discord Event:',posts[0]['content'])
+        self.assertEqual(len(announcements),1)
 
 
 if __name__=='__main__':

@@ -73,20 +73,14 @@ class OnceTests(unittest.TestCase):
         self.assertEqual(poll_start({'config': test_cfg, 'poll_deadline': deadline.isoformat()}), NOW)
         self.assertEqual(poll_start({'config': regular_cfg, 'poll_deadline': deadline.isoformat()}), deadline - timedelta(days=3))
         self.assertEqual(mention(test_cfg, SimpleNamespace(id=987)), '')
-        guild = SimpleNamespace(
-            id=987,
-            roles=[
-                SimpleNamespace(
-                    id=123,
-                    name='Players',
-                    mention='<@&123>'
-                )
-            ]
-        )
+        configured_role = SimpleNamespace(id=123, name='Players', mention='<@&123>')
+        guild = SimpleNamespace(id=987,
+                                get_role=lambda role_id: configured_role if role_id == 123 else None)
 
         self.assertEqual(mention(regular_cfg, guild), '<@&123>')
-        self.assertEqual(mention({'ping_role_id': 987}, guild), '<@&123>')
-        self.assertEqual(mention(regular_cfg, SimpleNamespace(id=987, roles=[])), '')
+        # A blank/default role never falls back to @Player or @everyone.
+        self.assertEqual(mention({'ping_role_id': 987}, guild), '')
+        self.assertEqual(mention(regular_cfg, SimpleNamespace(id=987, get_role=lambda _: None)), '')
         self.assertEqual(event_title(test_cfg), 'Test Event')
         self.assertEqual(event_title(regular_cfg), 'Campaign')
 

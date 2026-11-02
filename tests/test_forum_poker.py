@@ -55,6 +55,7 @@ class FakeMessage:
 class FakeThread:
     def __init__(self,tid,guild,parent_id,archived=False, archive_minutes=4320):
         self.id=tid;self.guild=guild;self.parent_id=parent_id
+        self.name=f'Forum thread {tid}'
         self.archived=archived;self.auto_archive_duration=archive_minutes
         self.edits=[];self.posts=[]
         self.history_reads=0;self.fail=False
@@ -253,22 +254,34 @@ class ForumPokeTests(unittest.TestCase):
                      'bot.py','exec',flags=__future__.annotations.compiler_flag),namespace)
         command=namespace['poke_forums']
         another=FakeThread(88,self.guild,self.forum.id)
+        self.thread.name='Campaign Rules'
+        another.name='Character Creation'
         self.guild.threads[88]=another
         async def run():
             interaction=Inter(self.guild)
             await command(interaction,add='77,garbage,88',ping_now=True)
             self.assertIn('2 added',interaction.followup.messages[-1])
             self.assertIn('Invalid thread ID',interaction.followup.messages[-1])
+            self.assertIn('Campaign Rules (ID: `77`)', interaction.followup.messages[-1])
+            self.assertIn('Character Creation (ID: `88`)', interaction.followup.messages[-1])
             self.assertEqual(len(await poker.list_targets(self.store,10)),2)
             self.assertEqual(len(self.thread.posts),1)
             self.assertEqual(len(another.posts),1)
             interaction=Inter(self.guild)
             await command(interaction)
             self.assertIn('No changes made.',interaction.followup.messages[-1])
+            self.assertIn('Campaign Rules',interaction.followup.messages[-1])
             interaction=Inter(self.guild)
             await command(interaction,remove='77')
             self.assertIn('1 removed',interaction.followup.messages[-1])
+            self.assertIn('Character Creation',interaction.followup.messages[-1])
+            self.assertNotIn('Campaign Rules',interaction.followup.messages[-1])
             self.assertEqual([r['thread_id'] for r in await poker.list_targets(self.store,10)],[88])
+            # A deleted or inaccessible thread should not break the status response.
+            self.guild.threads.pop(88)
+            interaction=Inter(self.guild)
+            await command(interaction)
+            self.assertIn('Unavailable or inaccessible (ID: `88`)',interaction.followup.messages[-1])
         asyncio.run(run())
 
     def test_command_and_worker_are_separate_from_forum_preferences(self):

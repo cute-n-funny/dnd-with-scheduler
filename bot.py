@@ -1327,8 +1327,18 @@ async def poke_forums(interaction: discord.Interaction, add: str | None = None,
                 errors.append(f'Thread {thread_id}: {error}')
     lines.append(f'Monitored in this server: {len(watched)} thread(s).')
     if watched:
-        names = ', '.join(str(row['thread_id']) for row in watched[:15])
-        lines.append('Thread IDs: ' + names + (' …' if len(watched) > 15 else ''))
+        for row in watched[:15]:
+            thread_id = row['thread_id']
+            try:
+                # Resolve archived posts too; do not depend on the guild cache.
+                thread = await resolve_forum_thread(bot, guild, thread_id)
+                thread_name = str(getattr(thread, 'name', None) or f'Thread {thread_id}')
+                thread_name = thread_name.replace('\r', ' ').replace('\n', ' ')
+            except (ValueError, discord.HTTPException):
+                thread_name = 'Unavailable or inaccessible'
+            lines.append(f'• {thread_name} (ID: `{thread_id}`)')
+        if len(watched) > 15:
+            lines.append(f'...and {len(watched) - 15} more.')
     if errors:
         lines.append('⚠️ ' + '\n⚠️ '.join(errors[:10]))
         if len(errors) > 10:

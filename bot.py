@@ -24,6 +24,10 @@ from availability_ui import AvailabilityVotePanel
 from guild_preferences import (ensure_schema as ensure_preferences_schema,
                                load_all as load_preferences, get as get_preferences,
                                update as update_preferences, defaults as preference_defaults)
+from forum_poker import (ensure_schema as ensure_poke_schema, parse_ids as parse_poke_ids,
+                         list_targets as list_poke_targets, due_targets as due_poke_targets,
+                         add_targets as add_poke_targets, remove_targets as remove_poke_targets,
+                         resolve_forum_thread, run_one as poke_one_target)
 
 log = logging.getLogger("dnd_scheduler")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -631,14 +635,19 @@ class SchedulerBot(commands.Bot):
         self.store = Store(DB_PATH)
         ensure_schema(self.store)
         ensure_preferences_schema(self.store)
+        ensure_poke_schema(self.store)
         self.preferences_cache = {}
         self.guild_locks = {}
+        self.forum_poke_locks = {}
         self._started_guilds = set()
         self._lifecycle_lock = asyncio.Lock()
         self._closing = False
 
     def lock_for(self, guild_id):
         return self.guild_locks.setdefault(guild_id, asyncio.Lock())
+
+    def poke_lock_for(self, guild_id):
+        return self.forum_poke_locks.setdefault(guild_id, asyncio.Lock())
 
     async def cleanup_legacy_guild_commands(self, guild):
         """Remove the old GUILD_ID-scoped commands, retaining global commands.
@@ -683,6 +692,7 @@ class SchedulerBot(commands.Bot):
         await self.tree.sync()
         log.info("Registered global slash commands (may take time to appear)")
         self.worker.start()
+        self.poke_worker.start()
 
     async def on_ready(self):
         log.info("Logged in as %s (%s)", self.user, self.user.id)
@@ -731,6 +741,8 @@ class SchedulerBot(commands.Bot):
                         # Preserve the 'running' flag. The next startup will
                         # report the unclean shutdown retrospectively.
                         log.exception("Could not publish shutdown notice in guild %s", guild.id)
+        if self.poke_worker.is_running():
+            self.poke_worker.cancel()
         await super().close()
 
     async def on_guild_join(self, guild):
@@ -1072,6 +1084,23 @@ class SchedulerBot(commands.Bot):
     async def before_worker(self):
         await self.wait_until_ready()
 
+    @tasks.loop(minutes=1)
+    async def poke_worker(self):
+        # This worker does not depend on any active scheduler or forum preference.
+        for target in await due_poke_targets(self.store):
+            guild = self.get_guild(target['guild_id'])
+            if guild is None:
+                continue
+            async with self.poke_lock_for(guild.id):
+                # A command could have removed the target since this list was read.
+                current = await list_poke_targets(self.store, guild.id)
+                if any(item['thread_id'] == target['thread_id'] for item in current):
+                    await poke_one_target(self, guild, target)
+
+    @poke_worker.before_loop
+    async def before_poke_worker(self):
+        await self.wait_until_ready()
+
 
 bot = SchedulerBot()
 
@@ -1244,6 +1273,68 @@ async def set_preferences(interaction: discord.Interaction,
     lines.append('Pingable role: ' + (f"<@&{settings['ping_role_id']}>" if settings['ping_role_id'] else 'none'))
     await interaction.response.send_message('\n'.join(lines), ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="poke_forums", description="Keep selected forum threads active every three days")
+@app_commands.guild_only()
+@app_commands.rename(ping_now="ping-now")
+@app_commands.describe(
+    add="Thread ID or comma-separated thread IDs to monitor",
+    remove="Thread ID or comma-separated IDs to stop monitoring",
+    ping_now="Refresh all monitored threads now (default false)")
+async def poke_forums(interaction: discord.Interaction, add: str | None = None,
+                      remove: str | None = None, ping_now: bool = False):
+    # This feature is independent of channel-for-forum and the required
+    # scheduler preferences, but honors the configured command whitelist.
+    if not await admin_gate(interaction, require_preferences=False):
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    additions, add_errors = parse_poke_ids(add)
+    removals, remove_errors = parse_poke_ids(remove)
+    errors = add_errors + remove_errors
+    valid_adds = []
+    for thread_id in additions:
+        try:
+            await resolve_forum_thread(bot, guild, thread_id)
+        except (ValueError, discord.HTTPException) as exc:
+            errors.append(f'Thread {thread_id}: {exc}')
+        else:
+            valid_adds.append(thread_id)
+
+    async with bot.poke_lock_for(guild.id):
+        removed = await remove_poke_targets(bot.store, guild.id, removals)
+        added = await add_poke_targets(bot.store, guild.id, valid_adds)
+        results = []
+        if ping_now is True:
+            for target in await list_poke_targets(bot.store, guild.id):
+                ok, error = await poke_one_target(bot, guild, target)
+                results.append((target['thread_id'], ok, error))
+        watched = await list_poke_targets(bot.store, guild.id)
+
+    lines = []
+    if not additions and not removals and ping_now is not True:
+        lines.append('No changes made.')
+    else:
+        lines.append(f'Updated monitored threads: {added} added, {removed} removed.')
+    if ping_now is True:
+        passed = sum(ok for _, ok, _ in results)
+        lines.append(f'Poked now: {passed}/{len(results)} thread(s).')
+        if not results:
+            lines.append('No threads are currently monitored.')
+        for thread_id, ok, error in results:
+            if not ok:
+                errors.append(f'Thread {thread_id}: {error}')
+    lines.append(f'Monitored in this server: {len(watched)} thread(s).')
+    if watched:
+        names = ', '.join(str(row['thread_id']) for row in watched[:15])
+        lines.append('Thread IDs: ' + names + (' …' if len(watched) > 15 else ''))
+    if errors:
+        lines.append('⚠️ ' + '\n⚠️ '.join(errors[:10]))
+        if len(errors) > 10:
+            lines.append(f'...and {len(errors)-10} more errors.')
+    await interaction.followup.send('\n'.join(lines)[:1950], ephemeral=True,
+                                    allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="scheduler_status", description="Show the current scheduler phase and upcoming actions (private)")

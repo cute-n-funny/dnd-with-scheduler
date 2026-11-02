@@ -49,17 +49,17 @@ class AvailabilityVotePanel(discord.ui.View):
             min_values=1,max_values=len(self.visible_days()),options=self.day_options())
         self.day_select.callback=self.choose_days
         self.add_item(self.day_select)
-        self.start_select=discord.ui.Select(row=2,placeholder='Available Time: Start',
+        self.start_select=discord.ui.Select(row=2,placeholder='Choose your earliest start time',
             min_values=1,max_values=len(self.times),options=self.start_options())
         self.start_select.callback=self.choose_starts
         self.add_item(self.start_select)
-        self.hours_select=discord.ui.Select(row=3,placeholder='Available Time: Hours',
+        self.hours_select=discord.ui.Select(row=3,placeholder='Choose how many hours you can stay',
             min_values=1,max_values=1,options=self.hour_options())
         self.hours_select.callback=self.choose_hours
         self.add_item(self.hours_select)
         for label,style,callback in (
-            ('Add Times',discord.ButtonStyle.primary,self.add_windows),
-            ('Remove Times',discord.ButtonStyle.secondary,self.remove_windows),
+            ('Add Times',discord.ButtonStyle.success,self.add_windows),
+            ('Remove Times',discord.ButtonStyle.danger,self.remove_windows),
             ('Close',discord.ButtonStyle.secondary,self.close)):
             button=discord.ui.Button(label=label,style=style,row=4)
             button.callback=callback

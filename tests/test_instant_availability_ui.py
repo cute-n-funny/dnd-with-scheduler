@@ -80,7 +80,7 @@ class FakeInteraction:
 def mocked_discord():
     discord = ModuleType('discord')
     discord.ui = SimpleNamespace(View=FakeView, Select=FakeSelect, Button=FakeButton)
-    discord.ButtonStyle = SimpleNamespace(primary=1, secondary=2, success=3)
+    discord.ButtonStyle = SimpleNamespace(primary=1, secondary=2, success=3, danger=4)
     discord.SelectOption = FakeOption
     discord.Embed = FakeEmbed
     discord.HTTPException = type('HTTPException', (Exception,), {})
@@ -179,9 +179,10 @@ class PanelTests(unittest.TestCase):
             self.assertEqual(len(panel.children), 7)
             self.assertEqual([x.placeholder for x in panel.children[:4]], [
                 'Select a week','Choose one or more dates',
-                'Available Time: Start','Available Time: Hours'])
+                'Choose your earliest start time','Choose how many hours you can stay'])
             self.assertEqual([x.label for x in panel.children[4:]], [
                 'Add Times','Remove Times','Close'])
+            self.assertEqual([x.style for x in panel.children[4:]], [3,4,2])
             self.assertEqual(panel.target_days,set())
             self.assertFalse(any(opt.default for opt in panel.day_select.options))
             self.assertEqual(panel.selected_hours,3)

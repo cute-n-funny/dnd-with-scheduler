@@ -51,12 +51,19 @@ def poll_start(record):
 
 
 def players_mention(guild):
-    """Use the real Players role ID; never fall back to @everyone."""
-    role = next((r for r in getattr(guild, "roles", ())
-                 if r.name.casefold() == "players"), None)
+    """Mention the server's Player/Players role by ID, never @everyone."""
+    roles = getattr(guild, "roles", ())
+    # Existing servers may have the singular Player role; newer ones use Players.
+    role = next((r for r in roles if r.name.casefold() == "player"), None)
     if role is None:
-        log.warning("Players role not found in guild %s; no role ping sent", guild.id)
+        role = next((r for r in roles if r.name.casefold() == "players"), None)
+    if role is None:
+        log.warning("Player/Players role not found in guild %s; no role ping sent", guild.id)
         return ""
+    me = getattr(guild, "me", None)
+    if not getattr(role, "mentionable", True) and not (
+            me and getattr(me.guild_permissions, "mention_everyone", False)):
+        log.warning("Role %s is not mentionable; enable role mentions or give the bot Mention Everyone permission", role.name)
     return role.mention
 
 
@@ -821,15 +828,20 @@ class SchedulerBot(commands.Bot):
                                 record["cycle"], self.slots_for(record))
         windows = await read_windows(self.store, guild.id, record["cycle"])
         embeds, files = build_window_visual_poll(record, votes, windows)
+        # Explicitly permit only role pings (never @everyone), even when the
+        # image-upload fallback is used. Test mode's mention() stays empty.
+        allowed = discord.AllowedMentions(everyone=False, roles=True, users=False)
         try:
             message = await channel.send(content=mention(record["config"], guild),
-                                         embeds=embeds, files=files, view=view)
+                                         embeds=embeds, files=files, view=view,
+                                         allowed_mentions=allowed)
         except discord.HTTPException:
             if not files:
                 raise
             log.exception("Could not upload heatmap; posting text-grid poll instead")
             message = await channel.send(content=mention(record["config"], guild),
-                                         embed=embeds[0], view=view)
+                                         embed=embeds[0], view=view,
+                                         allowed_mentions=allowed)
         await self.store.update(guild.id, state="poll", poll_message_id=message.id)
         log.info("Published poll guild=%s cycle=%s", guild.id, record["cycle"])
 

@@ -106,7 +106,7 @@ class AvailabilityTests(unittest.TestCase):
             def add_item(self,item):self.children.append(item)
         class FakeEmbed:
             def __init__(self,**kw):self.__dict__.update(kw)
-        styles=SimpleNamespace(primary=1,secondary=2,success=3)
+        styles=SimpleNamespace(primary=1,secondary=2,success=3,danger=4)
         discord=SimpleNamespace(ui=SimpleNamespace(View=FakeView,Select=FakeSelect,Button=FakeButton),
                                 SelectOption=FakeOption,ButtonStyle=styles,Embed=FakeEmbed)
         ns=dict(discord=discord,date=date,datetime=datetime,timedelta=timedelta,timezone=timezone,

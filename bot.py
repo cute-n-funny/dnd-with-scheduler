@@ -18,7 +18,8 @@ from logic import (choose_slot, event_datetimes, google_calendar_url, make_ics,
                    parse_days, parse_times, slot_keys)
 from storage import Store
 from heatmap import render_heatmaps
-from availability import ensure_schema, read_windows, carry_windows, windows_for_heatmap
+from availability import (ensure_schema, read_windows, carry_windows,
+                          windows_for_heatmap, test_window_votes)
 from availability_ui import AvailabilityVotePanel
 
 log = logging.getLogger("dnd_scheduler")
@@ -875,6 +876,13 @@ class SchedulerBot(commands.Bot):
     async def close_poll(self, guild, record):
         votes = await self.store.votes(guild.id, record["cycle"])
         slots = [s for s in self.slots_for(record) if event_datetimes(s, record["config"])[0] > utcnow() + timedelta(minutes=5)]
+        if is_test(record["config"]):
+            # Test runs still choose a winning *voted poll slot*, even though
+            # the simulated event starts one minute after the poll closes.
+            # A three-hour availability window must count for this one-minute
+            # test, regardless of the normal event_duration (often four hours).
+            windows = await read_windows(self.store, guild.id, record["cycle"])
+            votes = test_window_votes(votes, windows, slots)
         # min_votes is distinct people on a calendar DATE, not raw slots/clicks.
         # Test mode bypasses the minimum, preserving its one-vote/zero-vote smoke tests.
         minimum = 1 if is_test(record["config"]) else record["config"].get("min_votes", 3)

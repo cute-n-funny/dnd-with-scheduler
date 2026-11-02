@@ -116,10 +116,12 @@ class MinVotesTests(unittest.TestCase):
         self.assertEqual(selected, far)
 
     def close_function(self):
+        async def no_windows(*args): return []
         return source_function('close_poll', method=True, choose_slot=choose_slot,
                                utcnow=lambda: NOW, timedelta=timedelta,
                                event_datetimes=lambda s, c: (NOW + timedelta(days=8), NOW + timedelta(days=8, hours=4)),
                                is_test=lambda c: c.get('test_mode', False),
+                               read_windows=no_windows, test_window_votes=lambda votes, windows, slots: votes,
                                log=SimpleNamespace(info=lambda *args: None))
 
     def test_poll_under_minimum_schedules_24_hour_retry_and_no_event(self):

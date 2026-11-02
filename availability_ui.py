@@ -178,10 +178,14 @@ class AvailabilityVotePanel(discord.ui.View):
                 else:
                     windows[key]=self.selected_hours
             try:
+                # Test events last one minute; require only one minute of
+                # availability instead of the normal campaign event duration.
+                required_hours = (1 / 60 if record['config'].get('test_mode')
+                                  else record['config']['event_duration'])
                 qualifying=await save_windows(
                     self.bot.store,self.guild_id,self.cycle,self.user_id,
                     [(day,start,h) for (day,start),h in windows.items()],
-                    slots,record['config']['event_duration'],self.max_hours)
+                    slots,required_hours,self.max_hours)
             except ValueError:
                 return await interaction.response.edit_message(
                     embed=self.embed('Invalid selection. Reopen the poll and try again.'),view=self)

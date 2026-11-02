@@ -76,6 +76,12 @@ class Store:
 
     async def delete(self, guild_id):
         async with self.lock:
+            # A reset/end must also clear interval availability so the next
+            # test or normal poll (which starts at cycle 1) cannot inherit
+            # orphaned votes from an unrelated previous schedule.
+            if self.db.execute("SELECT 1 FROM sqlite_master "
+                               "WHERE type='table' AND name='availability_windows'").fetchone():
+                self.db.execute("DELETE FROM availability_windows WHERE guild_id=?", (guild_id,))
             for table in ("votes", "rsvps", "schedulers"):
                 self.db.execute(f"DELETE FROM {table} WHERE guild_id=?", (guild_id,))
 
@@ -132,8 +138,10 @@ class Store:
 
     async def rsvps(self, guild_id, cycle):
         async with self.lock:
+            # Preserve DM-first insertion order when auto-RSVP timestamps tie.
+            # ORDER BY user_id would otherwise reorder same-timestamp inserts.
             return [dict(r) for r in self.db.execute("SELECT user_id,status,created_at FROM rsvps "
-                "WHERE guild_id=? AND cycle=? ORDER BY created_at,user_id", (guild_id, cycle))]
+                "WHERE guild_id=? AND cycle=? ORDER BY created_at,rowid", (guild_id, cycle))]
 
     async def toggle_rsvp(self, guild_id, cycle, user_id, limit):
         """Serializes counts and RSVP updates. Returns own status and promoted user if any."""

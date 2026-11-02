@@ -36,6 +36,33 @@ def _qualifying_slots(windows, slots, duration):
     return qualified
 
 
+def test_window_votes(votes, windows, valid_slots):
+    """Include all test-time availability, even windows shorter than a normal session.
+
+    /test_scheduler creates a one-minute event. Its future weekly time slots are
+    only *ballot choices*, not the real test event's start time. Reconstruct votes
+    from saved windows so votes submitted before an upgrade still qualify.
+    One user counts only once per exact slot, with the earliest saved timestamp.
+    """
+    valid = set(valid_slots)
+    by_key = {}
+    for vote in votes:
+        key = (vote["user_id"], vote["slot"])
+        if vote["slot"] in valid and (key not in by_key or
+                                      vote["created_at"] < by_key[key]["created_at"]):
+            by_key[key] = dict(vote)
+    for window in windows:
+        slots = _qualifying_slots([(window["day"], window["start"], window["hours"])],
+                                  valid, 1 / 60)
+        for slot in slots:
+            key = (window["user_id"], slot)
+            created = window["created_at"]
+            if key not in by_key or created < by_key[key]["created_at"]:
+                by_key[key] = {"user_id": window["user_id"], "slot": slot,
+                               "created_at": created}
+    return sorted(by_key.values(), key=lambda v: (v["created_at"], v["user_id"], v["slot"]))
+
+
 async def read_windows(store, guild_id, cycle, user_id=None):
     async with store.lock:
         if user_id is None:

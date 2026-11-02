@@ -107,10 +107,12 @@ class OnceTests(unittest.TestCase):
         asyncio.run(check())
 
     def test_no_vote_still_creates_one_minute_event(self):
+        async def no_windows(*args): return []
         (close_poll,) = funcs('close_poll', methods=True, utcnow=lambda: NOW,
                              timedelta=timedelta, choose_slot=choose_slot,
                              event_datetimes=lambda slot, cfg: (NOW + timedelta(days=8), NOW + timedelta(days=8, hours=4)),
                              is_test=lambda c: c.get('test_mode', False),
+                             read_windows=no_windows, test_window_votes=lambda votes, windows, slots: votes,
                              dtread=datetime.fromisoformat)
         async def check():
             cfg = {'test_mode': True, 'dm_id': 11, 'attendee_limit': 12}

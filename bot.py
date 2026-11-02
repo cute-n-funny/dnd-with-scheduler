@@ -640,6 +640,30 @@ class SchedulerBot(commands.Bot):
     def lock_for(self, guild_id):
         return self.guild_locks.setdefault(guild_id, asyncio.Lock())
 
+    async def cleanup_legacy_guild_commands(self, guild):
+        """Remove the old GUILD_ID-scoped commands, retaining global commands.
+
+        Older releases used copy_global_to()/sync(guild=...), so switching to
+        global-only sync did not remove those older guild registrations.
+        Record successful migrations per guild to avoid repeated API writes.
+        """
+        if await self.store.legacy_commands_cleared(guild.id):
+            return
+        scope = discord.Object(id=guild.id)
+        # No guild-scoped commands are intentionally defined by this bot now.
+        # If someone adds explicit guild commands later, don't wipe them.
+        if self.tree.get_commands(guild=scope):
+            log.warning("Skipping legacy command cleanup in guild %s: local guild commands exist", guild.id)
+            return
+        try:
+            self.tree.clear_commands(guild=scope)
+            await self.tree.sync(guild=scope)
+        except discord.HTTPException:
+            log.exception("Could not clear old guild-specific slash commands in %s", guild.id)
+            return  # Retry after the next reconnect; do not mark migrated.
+        await self.store.mark_legacy_commands_cleared(guild.id)
+        log.info("Cleared obsolete guild-specific slash commands in %s; globals retained", guild.id)
+
     def preferences_for(self, guild):
         return self.preferences_cache.get(guild.id, preference_defaults())
 
@@ -667,6 +691,9 @@ class SchedulerBot(commands.Bot):
             if self._closing:
                 return
             for guild in self.guilds:
+                # Run even for servers without preferences or a lifecycle channel.
+                # on_ready may recur; SQLite prevents duplicate migration writes.
+                await self.cleanup_legacy_guild_commands(guild)
                 if guild.id in self._started_guilds:
                     continue
                 channel = self.scheduler_channel(guild)
@@ -705,6 +732,11 @@ class SchedulerBot(commands.Bot):
                         # report the unclean shutdown retrospectively.
                         log.exception("Could not publish shutdown notice in guild %s", guild.id)
         await super().close()
+
+    async def on_guild_join(self, guild):
+        # Also handle joining a server after startup, without syncing globals
+        # into that guild or requiring /set_preferences first.
+        await self.cleanup_legacy_guild_commands(guild)
 
     def scheduler_channel(self, guild):
         # Lifecycle notices use the first configured valid command channel.

@@ -38,12 +38,28 @@ class Store:
             is_running INTEGER NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS legacy_command_cleanup (
+            guild_id INTEGER PRIMARY KEY,
+            cleared_at TEXT NOT NULL
+        );
         """)
         # Safe upgrade for an existing SQLite volume from an earlier release.
         current = {r[1] for r in self.db.execute("PRAGMA table_info(schedulers)")}
         for col in ("native_started", "native_ended"):
             if col not in current:
                 self.db.execute(f"ALTER TABLE schedulers ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+
+    async def legacy_commands_cleared(self, guild_id):
+        async with self.lock:
+            return self.db.execute(
+                "SELECT 1 FROM legacy_command_cleanup WHERE guild_id=?", (guild_id,)
+            ).fetchone() is not None
+
+    async def mark_legacy_commands_cleared(self, guild_id):
+        async with self.lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO legacy_command_cleanup (guild_id,cleared_at) VALUES (?,?)",
+                (guild_id, datetime.now(timezone.utc).isoformat()))
 
     async def all(self):
         async with self.lock:

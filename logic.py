@@ -40,7 +40,8 @@ def parse_time(value: str) -> time:
 
 def parse_times(value: str) -> list[str]:
     if not value.strip():
-        return ["14:00", "14:30", "15:00", "15:30", "16:00", "17:00", "18:00", "19:00"]
+        return ["14:00", "14:30", "15:00", "15:30", "16:00", "16:30",
+                "17:00", "17:30", "18:00", "18:30", "19:00"]
     pieces = [x.strip() for x in value.split(",")]
     if not 1 <= len(pieces) <= 12:
         raise ValueError("Times must contain 1–12 comma-separated values.")

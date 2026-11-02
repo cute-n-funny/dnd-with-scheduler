@@ -102,7 +102,8 @@ def is_admin(user):
 def config_defaults(guild, creator_id, channel_id):
     return dict(title="Title", description="Description for event", dm_id=creator_id,
                 weeks=2, days=[6, 0, 1, 2, 3, 4, 5],
-                times=["14:00", "14:30", "15:00", "15:30", "16:00", "17:00", "18:00", "19:00"],
+                times=["14:00", "14:30", "15:00", "15:30", "16:00", "16:30",
+                       "17:00", "17:30", "18:00", "18:30", "19:00"],
                 hours=8, poll_duration=2, min_votes=3, attendee_limit=8, poll_after_event=3,
                 reminder_before_event=6, ping_role_id=guild.id,
                 event_duration=4, timezone=TZ_NAME, channel_id=None, looping=True)
@@ -756,12 +757,8 @@ class SchedulerBot(commands.Bot):
         if old:
             await self.try_delete_message(guild, old["poll_channel_id"], old["poll_message_id"])
             await self.try_delete_message(guild, old["event_channel_id"], old["event_message_id"])
-            if old["forum_thread_id"]:
-                try:
-                    thread = guild.get_thread(old["forum_thread_id"]) or await self.fetch_channel(old["forum_thread_id"])
-                    await thread.delete(reason="Scheduler reset/end")
-                except discord.HTTPException:
-                    log.warning("Could not remove active session forum post")
+            # Forum posts are permanent campaign history. Never delete them when
+            # starting, resetting, or ending the scheduler.
         # Delete only future events actually created by this bot, not other admins' events.
         try:
             for event in await guild.fetch_scheduled_events():
@@ -779,7 +776,7 @@ class SchedulerBot(commands.Bot):
             channel = self.text_channel(guild, config)
             if not channel:
                 raise ValueError("Create a text channel containing 'scheduling' in its name, or set SCHEDULING_CHANNEL_ID.")
-            if not self.forum_channel(guild):
+            if not is_test(config) and not self.forum_channel(guild):
                 raise ValueError("Create a Forum channel named dnd-session-events, or set FORUM_CHANNEL_ID.")
             config["channel_id"] = channel.id
             validate_config(config)
@@ -922,12 +919,13 @@ class SchedulerBot(commands.Bot):
                     params["channel"] = voice
                 else:
                     params["entity_type"] = discord.EntityType.external
-                    params["location"] = "Discord — see session forum post"
+                    params["location"] = ("Discord — test session" if is_test(c)
+                                          else "Discord — see session forum post")
                 event = await guild.create_scheduled_event(**params)
                 event_id = event.id
             await self.store.update(guild.id, discord_event_id=event_id)
         thread_id = record["forum_thread_id"]
-        if not thread_id:
+        if not thread_id and not is_test(c):
             forum = self.forum_channel(guild)
             if not forum:
                 raise ValueError("Session forum channel not found")

@@ -32,22 +32,23 @@ class AnnouncementTests(unittest.TestCase):
         self.helpers = announcements_from_bot()
         self.players = SimpleNamespace(name='Players', id=777, mention='<@&777>')
         self.custom = SimpleNamespace(name='Event Alerts', id=888, mention='<@&888>')
-        self.guild = SimpleNamespace(id=123, roles=[self.players, self.custom])
+        self.guild = SimpleNamespace(id=123, roles=[self.players, self.custom],
+            get_role=lambda id_:next((r for r in [self.players, self.custom] if r.id == id_), None))
 
-    def test_default_poll_mentions_players_never_everyone(self):
+    def test_default_poll_has_no_role_ping(self):
         mention = self.helpers['mention']
-        self.assertEqual(mention({'ping_role_id': 123}, self.guild), '<@&777>')
-        self.assertEqual(mention({'ping_role_id': None}, self.guild), '<@&777>')
+        self.assertEqual(mention({'ping_role_id': 123}, self.guild), '')
+        self.assertEqual(mention({'ping_role_id': None}, self.guild), '')
         self.assertEqual(mention({'ping_role_id': 123, 'test_mode': True}, self.guild), '')
         self.assertNotIn('@everyone', mention({'ping_role_id': 123}, self.guild))
 
     def test_explicit_custom_poll_role_is_preserved(self):
         mention = self.helpers['mention']
         self.assertEqual(mention({'ping_role_id': 888}, self.guild), '<@&888>')
-        # Session announcements always use Players even if a custom reminder role is configured.
+        # Session announcements use the same per-server pingable-role setting.
         text = self.helpers['session_announcement']({'ping_role_id': 888}, self.guild, [])
-        self.assertIn('<@&777>', text)
-        self.assertNotIn('<@&888>', text)
+        self.assertIn('<@&888>', text)
+        self.assertNotIn('<@&777>', text)
 
     def test_missing_players_role_never_reverts_to_everyone(self):
         no_roles = SimpleNamespace(id=123, roles=[])
@@ -63,7 +64,7 @@ class AnnouncementTests(unittest.TestCase):
             {'user_id': 17, 'status': 'waitlist'},
         ]
         text = self.helpers['session_announcement']({}, self.guild, rsvps)
-        self.assertIn('<@&777>', text)
+        self.assertNotIn('<@&777>', text)  # blank preference means no ping
         self.assertIn('The following users have been added after voting:', text)
         self.assertLess(text.index('<@42>'), text.index('<@15>'))
         self.assertNotIn('<@17>', text)

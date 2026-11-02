@@ -21,6 +21,9 @@ from heatmap import render_heatmaps
 from availability import (ensure_schema, read_windows, carry_windows,
                           windows_for_heatmap, test_window_votes)
 from availability_ui import AvailabilityVotePanel
+from guild_preferences import (ensure_schema as ensure_preferences_schema,
+                               load_all as load_preferences, get as get_preferences,
+                               update as update_preferences, defaults as preference_defaults)
 
 log = logging.getLogger("dnd_scheduler")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -52,39 +55,28 @@ def poll_start(record):
 
 
 def players_mention(guild):
-    """Mention the server's Player/Players role by ID, never @everyone."""
-    roles = getattr(guild, "roles", ())
-    # Existing servers may have the singular Player role; newer ones use Players.
-    role = next((r for r in roles if r.name.casefold() == "player"), None)
-    if role is None:
-        role = next((r for r in roles if r.name.casefold() == "players"), None)
-    if role is None:
-        log.warning("Player/Players role not found in guild %s; no role ping sent", guild.id)
-        return ""
-    me = getattr(guild, "me", None)
-    if not getattr(role, "mentionable", True) and not (
-            me and getattr(me.guild_permissions, "mention_everyone", False)):
-        log.warning("Role %s is not mentionable; enable role mentions or give the bot Mention Everyone permission", role.name)
-    return role.mention
+    """Compatibility helper: role names no longer select notification targets."""
+    return ""
 
 
 def mention(config, guild):
-    """Normal polls/reminders use Players unless an admin selected a custom role."""
+    """Ping only the explicitly configured per-server role; never @everyone."""
     if is_test(config):
-        return ""  # Test mode never sends role pings.
+        return ""
     role_id = config.get("ping_role_id")
-    if role_id and role_id != guild.id:
-        role = next((r for r in getattr(guild, "roles", ()) if r.id == role_id), None)
-        if role:
-            return role.mention
-    return players_mention(guild)
+    if not role_id or role_id == guild.id:
+        return ""
+    role = guild.get_role(role_id)
+    if role is None:
+        return ""
+    return role.mention
 
 
 def session_announcement(config, guild, rsvps):
     """One-time text with calendar reminder and auto-confirmed voters."""
     calendar = ("📅 Remember to save this session using **Download iCal (.ics)** "
                 "or **Add to Google Calendar** below.")
-    ping = "" if is_test(config) else players_mention(guild)
+    ping = mention(config, guild)
     lines = [f"{ping} {calendar}".strip()]
     confirmed = [r["user_id"] for r in rsvps if r["status"] == "confirmed"]
     if confirmed:
@@ -113,7 +105,7 @@ def config_defaults(guild, creator_id, channel_id):
                 times=["14:00", "14:30", "15:00", "15:30", "16:00", "16:30",
                        "17:00", "17:30", "18:00", "18:30", "19:00"],
                 hours=8, poll_duration=2, min_votes=3, attendee_limit=8, poll_after_event=3,
-                reminder_before_event=6, ping_role_id=guild.id,
+                reminder_before_event=6, ping_role_id=None,
                 event_duration=4, timezone=TZ_NAME, channel_id=None, location="", looping=True)
 
 
@@ -638,6 +630,8 @@ class SchedulerBot(commands.Bot):
                          allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=False))
         self.store = Store(DB_PATH)
         ensure_schema(self.store)
+        ensure_preferences_schema(self.store)
+        self.preferences_cache = {}
         self.guild_locks = {}
         self._started_guilds = set()
         self._lifecycle_lock = asyncio.Lock()
@@ -646,21 +640,24 @@ class SchedulerBot(commands.Bot):
     def lock_for(self, guild_id):
         return self.guild_locks.setdefault(guild_id, asyncio.Lock())
 
+    def preferences_for(self, guild):
+        return self.preferences_cache.get(guild.id, preference_defaults())
+
+    def role_config(self, guild, config):
+        """Use the live guild role preference, not an old saved campaign setting."""
+        return {**config, "ping_role_id": self.preferences_for(guild)['ping_role_id']}
+
     async def setup_hook(self):
+        self.preferences_cache = await load_preferences(self.store)
         for r in await self.store.all():
             if r["state"] == "poll" and r["poll_message_id"]:
                 self.add_view(PollMessageView(self, r["guild_id"], r["cycle"]), message_id=r["poll_message_id"])
             if r["state"] in ("event", "waiting", "creating_event") and r["event_message_id"]:
                 self.add_view(EventMessageView(self, r), message_id=r["event_message_id"])
-        guild_id = os.getenv("GUILD_ID", "").strip()
-        if guild_id:
-            guild = discord.Object(id=int(guild_id))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            log.info("Registered slash commands in guild %s", guild_id)
-        else:
-            await self.tree.sync()
-            log.info("Registered global slash commands (may take time to appear)")
+        # One global command tree lets the bot serve every Discord server.
+        # The former GUILD_ID-only registration silently hid commands elsewhere.
+        await self.tree.sync()
+        log.info("Registered global slash commands (may take time to appear)")
         self.worker.start()
 
     async def on_ready(self):
@@ -710,47 +707,24 @@ class SchedulerBot(commands.Bot):
         await super().close()
 
     def scheduler_channel(self, guild):
-        # Explicit channel ID takes priority; otherwise require #scheduler.
-        raw_id = os.getenv("SCHEDULER_CHANNEL_ID", "").strip()
-        if raw_id:
-            try:
-                channel = guild.get_channel(int(raw_id))
-            except ValueError:
-                log.error("SCHEDULER_CHANNEL_ID must be a numeric Discord channel ID")
-                return None
-            return channel if isinstance(channel, discord.TextChannel) else None
-        return next((c for c in guild.text_channels if c.name.lower() == "scheduler"), None)
+        # Lifecycle notices use the first configured valid command channel.
+        # Without a private command channel, avoid broadcasting Fly notices.
+        allowed = self.preferences_for(guild)['command_channel_ids']
+        for channel_id in allowed:
+            channel = guild.get_channel(channel_id)
+            if isinstance(channel, discord.TextChannel):
+                return channel
+        return None
 
     def text_channel(self, guild, config=None):
-        # Public polls/RSVP/reminders must NEVER be routed into the private
-        # #scheduler control channel, even when a saved configuration predates
-        # the private/public channel split.
-        control = self.scheduler_channel(guild)
-        explicit = os.getenv("SCHEDULING_CHANNEL_ID", "").strip()
-        if explicit:
-            try:
-                target = guild.get_channel(int(explicit))
-            except ValueError:
-                log.error("SCHEDULING_CHANNEL_ID must be a numeric Discord channel ID")
-                return None
-            if not isinstance(target, discord.TextChannel) or (control and target.id == control.id):
-                log.error("SCHEDULING_CHANNEL_ID must point to a public text channel, not #scheduler")
-                return None
-            return target
-        saved_id = (config or {}).get("channel_id")
-        if saved_id:
-            channel = guild.get_channel(int(saved_id))
-            if isinstance(channel, discord.TextChannel) and (not control or channel.id != control.id):
-                return channel
-        return next((c for c in guild.text_channels
-                     if "scheduling" in c.name.lower() and (not control or c.id != control.id)), None)
+        # Announcements use the current per-guild preference, never channel
+        # names, old config.channel_id, or process-wide environment variables.
+        channel = guild.get_channel(self.preferences_for(guild)['announcements_id'])
+        return channel if isinstance(channel, discord.TextChannel) else None
 
     def forum_channel(self, guild):
-        target = int(os.getenv("FORUM_CHANNEL_ID") or 0)
-        channel = guild.get_channel(target) if target else None
-        if isinstance(channel, discord.ForumChannel): return channel
-        return next((c for c in guild.channels if isinstance(c, discord.ForumChannel)
-                     and "dnd-session-events" in c.name.lower()), None)
+        channel = guild.get_channel(self.preferences_for(guild)['forum_id'])
+        return channel if isinstance(channel, discord.ForumChannel) else None
 
     def voice_channel(self, guild):
         return next((c for c in guild.voice_channels if c.name.lower() in ("voice-chat", "vc")), None)
@@ -791,9 +765,9 @@ class SchedulerBot(commands.Bot):
         async with self.lock_for(guild.id):
             channel = self.text_channel(guild, config)
             if not channel:
-                raise ValueError("Create a text channel containing 'scheduling' in its name, or set SCHEDULING_CHANNEL_ID.")
-            if not is_test(config) and not self.forum_channel(guild):
-                raise ValueError("Create a Forum channel named dnd-session-events, or set FORUM_CHANNEL_ID.")
+                raise ValueError("channel-for-announcements is not set. Use /set_preferences.")
+            if not self.forum_channel(guild):
+                raise ValueError("channel-for-forum is not set. Use /set_preferences.")
             config["channel_id"] = channel.id
             validate_config(config)
             window = timedelta(minutes=1) if is_test(config) else timedelta(days=config["poll_duration"])
@@ -841,14 +815,14 @@ class SchedulerBot(commands.Bot):
         # image-upload fallback is used. Test mode's mention() stays empty.
         allowed = discord.AllowedMentions(everyone=False, roles=True, users=False)
         try:
-            message = await channel.send(content=mention(record["config"], guild),
+            message = await channel.send(content=mention(self.role_config(guild, record["config"]), guild),
                                          embeds=embeds, files=files, view=view,
                                          allowed_mentions=allowed)
         except discord.HTTPException:
             if not files:
                 raise
             log.exception("Could not upload heatmap; posting text-grid poll instead")
-            message = await channel.send(content=mention(record["config"], guild),
+            message = await channel.send(content=mention(self.role_config(guild, record["config"]), guild),
                                          embed=embeds[0], view=view,
                                          allowed_mentions=allowed)
         await self.store.update(guild.id, state="poll", poll_message_id=message.id)
@@ -931,7 +905,7 @@ class SchedulerBot(commands.Bot):
         start, end = dtread(record["event_start"]), dtread(record["event_end"])
         marker = f"DND-SCHEDULER:{guild.id}:{record['cycle']}"
         event_id = record["discord_event_id"]
-        if not event_id:
+        if self.preferences_for(guild)['activate_discord_events'] and not event_id:
             # Find prior matching event on an interrupted create, avoiding duplicates.
             events = await guild.fetch_scheduled_events()
             existing = next((e for e in events if marker in (e.description or "") and
@@ -962,8 +936,8 @@ class SchedulerBot(commands.Bot):
                        f"Starts: <t:{int(start.timestamp())}:F>\n"
                        f"Ends: <t:{int(end.timestamp())}:F>\n"
                        f"DM: <@{c['dm_id']}>\n"
-                       f"Discord Event: {event_link(guild.id, event_id)}\n\n"
-                       "RSVP in the scheduling channel; discuss characters and preparations here.")
+                       + (f"Discord Event: {event_link(guild.id, event_id)}\n" if event_id else "")
+                       + "\nRSVP in the scheduling channel; discuss characters and preparations here.")
             created = await forum.create_thread(name=f"{event_title(c)} — {start.astimezone(ZoneInfo(c['timezone'])).strftime('%b %d')}",
                                                 content=message)
             thread_id = created.thread.id
@@ -973,7 +947,7 @@ class SchedulerBot(commands.Bot):
             channel = self.text_channel(guild, c)
             if not channel: raise ValueError("Scheduling channel not found")
             rsvps = await self.store.rsvps(guild.id, record["cycle"])
-            msg = await channel.send(content=session_announcement(c, guild, rsvps),
+            msg = await channel.send(content=session_announcement(self.role_config(guild, c), guild, rsvps),
                                      embed=build_event_embed(record, rsvps),
                                      view=EventMessageView(self, record),
                                      allowed_mentions=discord.AllowedMentions(
@@ -997,8 +971,9 @@ class SchedulerBot(commands.Bot):
         if not channel:
             raise ValueError("Scheduling text channel missing")
         when = int(dtread(record["event_start"]).timestamp())
-        await channel.send(f"⏰ {mention(record['config'], guild)} **{record['config']['title']}** begins <t:{when}:R>! "
-                           f"RSVP: https://discord.com/channels/{guild.id}/{record['event_channel_id']}/{record['event_message_id']}")
+        await channel.send(f"⏰ {mention(self.role_config(guild, record['config']), guild)} **{record['config']['title']}** begins <t:{when}:R>! "
+                           f"RSVP: https://discord.com/channels/{guild.id}/{record['event_channel_id']}/{record['event_message_id']}",
+                           allowed_mentions=discord.AllowedMentions(everyone=False, roles=True, users=False))
         await self.store.update(guild.id, reminded=1)
 
 
@@ -1069,20 +1044,42 @@ class SchedulerBot(commands.Bot):
 bot = SchedulerBot()
 
 
-async def admin_gate(interaction):
+def missing_preferences(guild, settings):
+    """Channel IDs are only set when they still exist with the correct type."""
+    missing = []
+    if not isinstance(guild.get_channel(settings['announcements_id']), discord.TextChannel):
+        missing.append('channel-for-announcements')
+    if not isinstance(guild.get_channel(settings['forum_id']), discord.ForumChannel):
+        missing.append('channel-for-forum')
+    return missing
+
+
+async def admin_gate(interaction, *, require_preferences=True):
     if not interaction.guild or not is_admin(interaction.user):
         await interaction.response.send_message("Only server admins or users with Manage Server can control the scheduler.", ephemeral=True)
         return False
-    channel = bot.scheduler_channel(interaction.guild)
-    if channel is None:
+    guild = interaction.guild
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Use a server text channel for scheduler commands.", ephemeral=True)
+        return False
+    settings = await get_preferences(bot.store, guild.id)
+    bot.preferences_cache[guild.id] = settings
+    # If no allowed command channel remains (none set, or all deleted),
+    # administrative commands are permitted from any text channel.
+    valid = [id_ for id_ in settings['command_channel_ids']
+             if isinstance(guild.get_channel(id_), discord.TextChannel)]
+    if valid and interaction.channel_id not in valid:
         await interaction.response.send_message(
-            "Create a private text channel named `scheduler`, or configure SCHEDULER_CHANNEL_ID with its channel ID.",
+            'Scheduler commands can only be used in ' + ', '.join(f'<#{id_}>' for id_ in valid) + '.',
             ephemeral=True)
         return False
-    if interaction.channel_id != channel.id:
-        await interaction.response.send_message(
-            f"Scheduler commands can only be used in {channel.mention}.", ephemeral=True)
-        return False
+    if require_preferences:
+        missing = missing_preferences(guild, settings)
+        if missing:
+            await interaction.response.send_message(
+                'Missing required scheduler preferences: ' + ', '.join(missing) +
+                '. Use `/set_preferences` before any scheduler commands.', ephemeral=True)
+            return False
     return True
 
 
@@ -1141,6 +1138,82 @@ def build_scheduler_status(record, votes, rsvps):
     return result
 
 
+@bot.tree.command(name="set_preferences", description="Configure channels, event creation and pings for this server")
+@app_commands.guild_only()
+@app_commands.rename(channel_for_announcements="channel-for-announcements",
+                     channel_for_forum="channel-for-forum",
+                     channel_for_commands="channel-for-commands",
+                     activate_discord_events="activate-discord-events",
+                     pingable_role="pingable-role")
+@app_commands.describe(
+    channel_for_announcements="Text channel for polls, RSVPs and reminders",
+    channel_for_forum="Forum channel for session discussions",
+    channel_for_commands="Toggle one text channel in the allowed command channels",
+    activate_discord_events="Create Discord built-in Scheduled Events (default false)",
+    pingable_role="Role to ping on availability and Session Details (optional)")
+async def set_preferences(interaction: discord.Interaction,
+    channel_for_announcements: discord.abc.GuildChannel | None = None,
+    channel_for_forum: discord.abc.GuildChannel | None = None,
+    channel_for_commands: discord.abc.GuildChannel | None = None,
+    activate_discord_events: bool | None = None,
+    pingable_role: discord.Role | None = None):
+    if not await admin_gate(interaction, require_preferences=False): return
+    guild = interaction.guild
+    updates, errors, changed = {}, [], []
+    toggle = None
+    if channel_for_announcements is not None:
+        if isinstance(channel_for_announcements, discord.TextChannel) and channel_for_announcements.guild.id == guild.id:
+            updates['announcements_id'] = channel_for_announcements.id
+            changed.append('channel-for-announcements updated')
+        else:
+            errors.append('channel-for-announcements is not valid (must be a text channel)')
+    if channel_for_forum is not None:
+        if isinstance(channel_for_forum, discord.ForumChannel) and channel_for_forum.guild.id == guild.id:
+            updates['forum_id'] = channel_for_forum.id
+            changed.append('channel-for-forum updated')
+        else:
+            errors.append('channel-for-forum is not valid (must be a forum channel)')
+    if channel_for_commands is not None:
+        if isinstance(channel_for_commands, discord.TextChannel) and channel_for_commands.guild.id == guild.id:
+            toggle = channel_for_commands.id
+            changed.append('channel-for-commands toggled')
+        else:
+            errors.append('channel-for-commands is not valid (must be a text channel)')
+    if activate_discord_events is not None:
+        if type(activate_discord_events) is bool:
+            updates['activate_discord_events'] = activate_discord_events
+            changed.append('activate-discord-events updated')
+        else:
+            errors.append('activate-discord-events must be true or false')
+    if pingable_role is not None:
+        if pingable_role.id != guild.id and pingable_role.guild.id == guild.id:
+            updates['ping_role_id'] = pingable_role.id
+            changed.append('pingable-role updated')
+        else:
+            errors.append('pingable-role cannot be @everyone or a role from another server')
+    if updates or toggle is not None:
+        settings = await update_preferences(bot.store, guild.id,
+                                             fields=updates, toggle_command_id=toggle)
+    else:
+        settings = await get_preferences(bot.store, guild.id)
+    bot.preferences_cache[guild.id] = settings
+    missing = missing_preferences(guild, settings)
+    lines = ['✅ ' + ', '.join(changed) if changed else 'No preferences changed.']
+    if errors:
+        lines.append('⚠️ ' + '\n⚠️ '.join(errors))
+    if missing:
+        lines.append('⚠️ Required preferences not set: ' + ', '.join(missing) +
+                     '. Use `/set_preferences` to configure them.')
+    lines.append('Announcements: ' + (f"<#{settings['announcements_id']}>" if settings['announcements_id'] else 'not set'))
+    lines.append('Forum: ' + (f"<#{settings['forum_id']}>" if settings['forum_id'] else 'not set'))
+    lines.append('Command channels: ' + (', '.join(f'<#{x}>' for x in settings['command_channel_ids'])
+                                          or 'any text channel'))
+    lines.append('Discord events: ' + ('enabled' if settings['activate_discord_events'] else 'disabled'))
+    lines.append('Pingable role: ' + (f"<@&{settings['ping_role_id']}>" if settings['ping_role_id'] else 'none'))
+    await interaction.response.send_message('\n'.join(lines), ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none())
+
+
 @bot.tree.command(name="scheduler_status", description="Show the current scheduler phase and upcoming actions (private)")
 @app_commands.guild_only()
 async def scheduler_status(interaction: discord.Interaction):
@@ -1163,7 +1236,7 @@ async def scheduler_status(interaction: discord.Interaction):
     min_votes="Minimum distinct voters on a date (3–12; default 3)",
     poll_after_event="Hours after the event ends before next poll (3–24)",
     reminder_before_event="Hours before session START to remind players (3–24)",
-    ping_role="Optional poll/reminder role (default Players; events always ping Players)",
+    ping_role="Deprecated: use /set_preferences pingable-role for guild pings",
     event_duration="Session duration in hours (1–24)",
     hours="Maximum availability duration in hours (4–8; 1-hour steps)",
     location="Optional physical or online session location (default blank)")
@@ -1183,7 +1256,7 @@ async def start_scheduler(interaction: discord.Interaction, title: str = "Title"
                  hours=hours, poll_duration=poll_duration, attendee_limit=attendee_limit,
                  min_votes=min_votes,
                  poll_after_event=poll_after_event, reminder_before_event=reminder_before_event,
-                 ping_role_id=ping_role.id if ping_role else interaction.guild.id,
+                 ping_role_id=bot.preferences_for(interaction.guild)['ping_role_id'],
                  event_duration=event_duration, location=location.strip(), looping=True)
         await bot.replace_scheduler(interaction.guild, c)
         await interaction.followup.send("✅ Recurring scheduler started! See the public voting channel for the poll.", ephemeral=True)

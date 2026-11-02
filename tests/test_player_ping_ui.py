@@ -28,45 +28,28 @@ def role(name, identifier):
 
 
 class PlayerPingTests(unittest.TestCase):
-    def test_singular_player_role_is_not_missed(self):
+    def test_blank_role_never_pings_even_if_player_role_exists(self):
         helpers, _ = load_helpers()
-        guild = SimpleNamespace(id=99, roles=[role('Player', 42)])
-        self.assertEqual(helpers['mention']({'ping_role_id': 99}, guild), '<@&42>')
+        guild = SimpleNamespace(id=99, roles=[role('Player', 42)], get_role=lambda id_:None)
+        self.assertEqual(helpers['mention']({'ping_role_id': None}, guild), '')
+        self.assertEqual(helpers['mention']({'ping_role_id': 99}, guild), '')
 
-    def test_plural_and_mixed_case_works(self):
+    def test_explicit_server_role_is_used(self):
         helpers, _ = load_helpers()
-        guild = SimpleNamespace(id=99, roles=[role('pLaYeRs', 43)])
-        self.assertEqual(helpers['mention']({'ping_role_id': None}, guild), '<@&43>')
-
-    def test_prefers_original_singular_role_if_both_exist(self):
-        helpers, _ = load_helpers()
-        guild = SimpleNamespace(id=99, roles=[role('Players', 43), role('Player', 42)])
-        self.assertEqual(helpers['mention']({'ping_role_id': 99}, guild), '<@&42>')
-
-    def test_explicit_custom_ping_role_still_works(self):
-        helpers, _ = load_helpers()
-        guild = SimpleNamespace(id=99, roles=[role('Player', 42), role('D&D Alerts', 60)])
+        target = role('Custom D&D Alerts', 60)
+        guild = SimpleNamespace(id=99, roles=[target], get_role=lambda id_:target if id_==60 else None)
         self.assertEqual(helpers['mention']({'ping_role_id': 60}, guild), '<@&60>')
 
     def test_test_mode_never_pings_a_role(self):
         helpers, _ = load_helpers()
-        guild = SimpleNamespace(id=99, roles=[role('Player', 42)])
+        target = role('Player', 42)
+        guild = SimpleNamespace(id=99, roles=[target], get_role=lambda id_:target)
         self.assertEqual(helpers['mention']({'test_mode': True, 'ping_role_id': 42}, guild), '')
 
     def test_missing_role_never_falls_back_to_everyone(self):
-        helpers, warnings = load_helpers()
-        guild = SimpleNamespace(id=99, roles=[])
-        self.assertEqual(helpers['mention']({'ping_role_id': 99}, guild), '')
-        self.assertTrue(warnings)
-
-    def test_unmentionable_role_has_diagnostic_warning(self):
-        helpers, warnings = load_helpers()
-        unmentionable = role('Player', 42)
-        unmentionable.mentionable = False
-        guild = SimpleNamespace(id=99, roles=[unmentionable], me=SimpleNamespace(
-            guild_permissions=SimpleNamespace(mention_everyone=False)))
-        self.assertEqual(helpers['mention']({'ping_role_id': 99}, guild), '<@&42>')
-        self.assertTrue(any('not mentionable' in str(args) for args in warnings))
+        helpers, _ = load_helpers()
+        guild = SimpleNamespace(id=99, roles=[], get_role=lambda id_:None)
+        self.assertEqual(helpers['mention']({'ping_role_id': 42}, guild), '')
 
     def test_both_poll_send_paths_explicitly_allow_role_mentions(self):
         root = ast.parse((ROOT / 'bot.py').read_text(encoding='utf-8'))

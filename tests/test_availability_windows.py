@@ -28,7 +28,7 @@ class AvailabilityTests(unittest.TestCase):
     def test_blank_defaults_and_7_day_support(self):
         self.assertEqual(parse_days(''),[6,0,1,2,3,4,5])
         self.assertEqual(len(parse_days('sun,mon,tue,wed,thu,fri,sat')),7)
-        self.assertEqual(parse_times(''), ['14:00','14:30','15:00','15:30','16:00','17:00','18:00','19:00'])
+        self.assertEqual(parse_times(''), ['14:00','14:30','15:00','15:30','16:00','16:30','17:00','17:30','18:00','18:30','19:00'])
 
     def test_short_window_not_mistaken_for_four_hour_attendance(self):
         slots=[f'2026-11-01T{t}' for t in ['14:00','14:30','15:00','15:30','16:00','17:00','18:00','19:00']]

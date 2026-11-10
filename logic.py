@@ -80,7 +80,8 @@ def choose_slot(votes: list[dict], valid_slots: list[str], dm_id: int, rng=None,
     """Require minimum distinct people per date before choosing a session.
 
     Earliest exact slot with >= attendee_limit wins among qualifying dates.
-    DM-voted days remain a constraint. With no qualified slot, use the original
+    DM-voted dates constrain only their own Sunday–Saturday calendar week;
+    weeks without a DM vote remain open. With no qualified slot, use the original
     popular-day, then popular-time method (random tie-breaks). A person voting
     for multiple times on one date is counted only once for the day tally.
     Returns exact-slot voters in earliest-vote order for automatic RSVPs.
@@ -96,7 +97,15 @@ def choose_slot(votes: list[dict], valid_slots: list[str], dm_id: int, rng=None,
         day_voters[vote["slot"][:10]].add(vote["user_id"])
         slot_voters[vote["slot"]].add(vote["user_id"])
     dm_days = {vote["slot"][:10] for vote in filtered if vote["user_id"] == dm_id}
-    eligible_days = dm_days if dm_days else set(day_voters)
+
+    def week_start(day):
+        local_day = date.fromisoformat(day)
+        return local_day - timedelta(days=(local_day.weekday() + 1) % 7)
+
+    dm_weeks = {week_start(day) for day in dm_days}
+    # A DM vote restricts other dates in that week, but not untouched weeks.
+    eligible_days = {day for day in day_voters
+                     if week_start(day) not in dm_weeks or day in dm_days}
     # A user selecting multiple times on a date is only one voter on that date.
     eligible_days = {day for day in eligible_days if len(day_voters[day]) >= min_votes}
     if not eligible_days:

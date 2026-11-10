@@ -64,12 +64,16 @@ def render_heatmaps(record, votes, *, windows=None, closed=False, winner=None):
         if vote['slot'] in valid:
             voters[vote['slot']].add(vote['user_id'])
     dm = c['dm_id']
-    dm_has_voted = any(v['user_id'] == dm for v in votes) or any(v['user_id'] == dm for v in windows)
+    valid_days = {s[:10] for s in valid}
+    # Match the scheduling rule: DM availability affects only the same week.
+    dm_weeks = {_week_start(date.fromisoformat(v['slot'][:10]))
+                for v in votes if v['slot'] in valid and v['user_id'] == dm}
+    dm_weeks.update(_week_start(date.fromisoformat(w['day']))
+                    for w in windows if w['day'] in valid_days and w['user_id'] == dm)
     active = set()
     for vote in votes:
         if vote['slot'] in valid:
             active.add(_week_start(date.fromisoformat(vote['slot'][:10])))
-    valid_days = {s[:10] for s in valid}
     for item in windows:
         if item['day'] in valid_days:
             active.add(_week_start(date.fromisoformat(item['day'])))
@@ -109,7 +113,7 @@ def render_heatmaps(record, votes, *, windows=None, closed=False, winner=None):
                 else:
                     active_users=set(voters.get(slot,set()))
                     active_users.update(w['user_id'] for w in windows if _in_window(day,t,w))
-                    color=_color(len(active_users),dm_has_voted,dm in active_users)
+                    color=_color(len(active_users),first in dm_weeks,dm in active_users)
                 d.rounded_rectangle(rect,radius=4,fill=color)
                 if winner==slot:
                     d.rounded_rectangle(rect,radius=4,outline=TEXT,width=3)

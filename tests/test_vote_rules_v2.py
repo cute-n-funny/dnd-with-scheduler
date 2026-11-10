@@ -40,12 +40,18 @@ class VoteRuleTests(unittest.TestCase):
         votes=voters(early, range(1,9))+voters(late,range(1,11))
         self.assertEqual(choose_slot(votes,[early,late],dm_id=100,attendee_limit=8)[0],early)
 
-    def test_dm_day_restriction_still_applies(self):
-        near='2026-11-07T14:00'
-        later='2026-11-14T14:00'
+    def test_dm_day_restriction_only_applies_in_its_week(self):
+        near='2026-11-07T14:00'  # Saturday of the first calendar week
+        later='2026-11-14T14:00' # Saturday of the second calendar week
         votes=voters(near,range(1,9))+voters(later,range(1,9))
         votes += [{'user_id': 99,'slot':later,'created_at':'2026-10-30T00:01:00+00:00'}]
-        self.assertEqual(choose_slot(votes,[near,later],dm_id=99,attendee_limit=8)[0],later)
+        # DM availability in week two must not exclude week one.
+        self.assertEqual(choose_slot(votes,[near,later],dm_id=99,attendee_limit=8)[0],near)
+        # But it still excludes other dates within the same week.
+        same_week='2026-11-13T14:00'
+        restricted=voters(same_week,range(1,9))+voters(later,range(1,9))
+        restricted += [{'user_id': 99,'slot':later,'created_at':'2026-10-30T00:01:00+00:00'}]
+        self.assertEqual(choose_slot(restricted,[same_week,later],dm_id=99,attendee_limit=8)[0],later)
 
     def test_fallback_most_popular_when_nobody_hits_limit(self):
         near='2026-11-07T14:00'

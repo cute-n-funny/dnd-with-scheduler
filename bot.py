@@ -255,8 +255,7 @@ def build_window_visual_poll(record, votes, windows, *, closed=False, winner=Non
                    f"(<t:{int(end.timestamp())}:R>)\n"
                    f"**DM:** <@{c['dm_id']}> · **Timezone:** `{c['timezone']}`\n"
                    "Use **Set My Availability** to choose dates, start times, and hours.\n"
-                   "Light green: 0–2 · Green: 3+ · Red: DM unavailable without votes · "
-                   "Orange: votes outside DM availability.")
+                   "Green: DM available. • Red/Orange: DM unavailable.")
     if c.get("location", "").strip():
         description += f"\n📍 **Location:** {c['location'].strip()}"
     if winner:

@@ -38,18 +38,25 @@ class FakeText:
 
 
 class FakeForum:
-    def __init__(self,cid):self.id=cid
+    def __init__(self,cid):
+        self.id=cid
+        self.name='Rule Reference Forum'
 
 
 class FakeMessage:
-    def __init__(self, mid, content, author=999):
+    def __init__(self, mid, content, author=999, thread=None):
         self.id=mid
         self.content=content
         self.author=SimpleNamespace(id=author)
-        self.edits=[]
-    async def edit(self, **kwargs):
-        self.edits.append(kwargs)
-        self.content=kwargs['content']
+        self.thread=thread
+        self.deleted=False
+        self.delete_fails=False
+    async def delete(self):
+        if self.delete_fails:
+            raise FakeHTTP('Cannot delete temporary poke message')
+        self.deleted=True
+        if self.thread and self in self.thread.posts:
+            self.thread.posts.remove(self)
 
 
 class FakeThread:
@@ -57,7 +64,7 @@ class FakeThread:
         self.id=tid;self.guild=guild;self.parent_id=parent_id
         self.name=f'Forum thread {tid}'
         self.archived=archived;self.auto_archive_duration=archive_minutes
-        self.edits=[];self.posts=[]
+        self.edits=[];self.posts=[];self.sent=[]
         self.history_reads=0;self.fail=False
     async def edit(self, **kwargs):
         if self.fail:raise FakeHTTP('Missing Manage Threads permission')
@@ -67,15 +74,18 @@ class FakeThread:
         return self
     async def fetch_message(self, mid):
         for msg in self.posts:
-            if msg.id==mid:return msg
+            if msg.id==mid:
+                msg.thread=self
+                return msg
         raise FakeNotFound('message deleted')
     async def history(self,limit):
         self.history_reads+=1
         for msg in list(reversed(self.posts))[:limit]:yield msg
     async def send(self,content,**kwargs):
         assert kwargs['silent'] is True
-        msg=FakeMessage(len(self.posts)+1111,content)
+        msg=FakeMessage(len(self.sent)+1111,content,thread=self)
         self.posts.append(msg)
+        self.sent.append(msg)
         return msg
 
 
@@ -149,25 +159,27 @@ class ForumPokeTests(unittest.TestCase):
             self.assertEqual(len(await poker.list_targets(self.store,11)),1)
         asyncio.run(after())
 
-    def test_active_thread_refreshes_archive_timer_and_edits_existing_message(self):
+    def test_active_thread_refreshes_archive_timer_and_deletes_temporary_message(self):
         async def run():
             await poker.add_targets(self.store,10,[77],now=DATE)
             target=(await poker.list_targets(self.store,10))[0]
             with patch.object(poker,'utcnow',return_value=DATE):
-                self.assertEqual(await poker.poke_one(self.bot,self.guild,target),1111)
-                await poker.record_success(self.store,10,77,1111,now=DATE)
+                self.assertIsNone(await poker.poke_one(self.bot,self.guild,target))
+                await poker.record_success(self.store,10,77,now=DATE)
             self.assertEqual([v['auto_archive_duration'] for v in self.thread.edits],[1440,4320])
             self.assertEqual(self.thread.auto_archive_duration,4320)
-            self.assertEqual(len(self.thread.posts),1)
-            self.assertEqual(self.thread.posts[0].content,'Poked on: **11/01/2026**')
+            self.assertEqual(self.thread.posts,[])
+            self.assertEqual(len(self.thread.sent),1)
+            self.assertTrue(self.thread.sent[0].deleted)
+            self.assertEqual(self.thread.sent[0].content,'Poked on: **11/01/2026**')
             target=(await poker.list_targets(self.store,10))[0]
-            self.assertEqual(target['message_id'],1111)
+            self.assertIsNone(target['message_id'])
             self.assertEqual(target['next_poke_at'],(DATE+timedelta(days=3)).isoformat())
             with patch.object(poker,'utcnow',return_value=DATE+timedelta(days=3)):
-                self.assertEqual(await poker.poke_one(self.bot,self.guild,target),1111)
-            self.assertEqual(len(self.thread.posts),1)  # Edit, not another post.
-            self.assertEqual(self.thread.posts[0].content,'Poked on: **11/04/2026**')
-            self.assertEqual(len(self.thread.posts[0].edits),1)
+                self.assertIsNone(await poker.poke_one(self.bot,self.guild,target))
+            self.assertEqual(self.thread.posts,[])  # Never accumulate poke messages.
+            self.assertEqual(len(self.thread.sent),2)
+            self.assertTrue(all(m.deleted for m in self.thread.sent))
         asyncio.run(run())
 
     def test_archived_thread_unarchives_without_duration_churn(self):
@@ -181,16 +193,72 @@ class ForumPokeTests(unittest.TestCase):
         self.assertEqual(len(self.thread.edits),1)
         self.assertEqual(self.thread.edits[0]['archived'],False)
 
-    def test_found_existing_message_without_stored_id_is_edited(self):
-        self.thread.posts=[FakeMessage(2222,'Poked on: **10/29/2026**',999)]
+    def test_previous_saved_poke_is_deleted_without_touching_unrelated_messages(self):
+        previous=FakeMessage(2222,'Poked on: **10/29/2026**',999,thread=self.thread)
+        unrelated=FakeMessage(3333,'Do not delete campaign rules',999,thread=self.thread)
+        self.thread.posts=[previous,unrelated]
+        async def run():
+            await poker.add_targets(self.store,10,[77],now=DATE)
+            await poker.record_sent(self.store,10,77,2222)
+            target=(await poker.list_targets(self.store,10))[0]
+            with patch.object(poker,'utcnow',return_value=DATE):
+                await poker.run_one(self.bot,self.guild,target)
+            self.assertIsNone((await poker.list_targets(self.store,10))[0]['message_id'])
+        asyncio.run(run())
+        self.assertTrue(previous.deleted)
+        self.assertFalse(unrelated.deleted)
+        self.assertEqual(self.thread.posts,[unrelated])
+        self.assertEqual(len(self.thread.sent),1)
+        self.assertTrue(self.thread.sent[0].deleted)
+
+    def test_delete_failure_retries_and_cleans_up_stale_message(self):
+        channel=FakeText(50)
+        self.guild.channels[50]=channel
+        self.bot.settings['command_channel_ids']=[50]
+        self.thread.name='House Rules'
+        original_send=self.thread.send
+        async def send_failing_delete(content,**kwargs):
+            message=await original_send(content,**kwargs)
+            message.delete_fails=True
+            return message
+        self.thread.send=send_failing_delete
         async def run():
             await poker.add_targets(self.store,10,[77],now=DATE)
             with patch.object(poker,'utcnow',return_value=DATE):
-                message_id=await poker.poke_one(self.bot,self.guild,(await poker.list_targets(self.store,10))[0])
-            self.assertEqual(message_id,2222)
-        asyncio.run(run())
-        self.assertEqual(len(self.thread.posts),1)
-        self.assertEqual(len(self.thread.posts[0].edits),1)
+                ok,error=await poker.run_one(self.bot,self.guild,(await poker.list_targets(self.store,10))[0])
+            self.assertFalse(ok)
+            self.assertIn('Cannot delete',error)
+            self.assertIn('House Rules',channel.messages[0])
+            self.assertIn('Rule Reference Forum',channel.messages[0])
+            self.assertIn('77',channel.messages[0])
+            row=(await poker.list_targets(self.store,10))[0]
+            self.assertEqual(row['message_id'],1111)
+            self.assertEqual(row['next_poke_at'],(DATE+timedelta(hours=1)).isoformat())
+            self.assertEqual(len(self.thread.posts),1)
+            self.thread.sent[0].delete_fails=False
+            self.thread.send=original_send
+            with patch.object(poker,'utcnow',return_value=DATE+timedelta(hours=1)):
+                ok,error=await poker.run_one(self.bot,self.guild,row)
+            self.assertTrue(ok)
+            self.assertIsNone(error)
+            self.assertEqual(self.thread.posts,[])
+            self.assertTrue(all(m.deleted for m in self.thread.sent))
+            self.assertIsNone((await poker.list_targets(self.store,10))[0]['message_id'])
+        with self.assertLogs('dnd_scheduler.forum_poker',level='ERROR'):
+            asyncio.run(run())
+
+    def test_error_for_deleted_thread_uses_id_fallback(self):
+        channel=FakeText(50)
+        self.guild.channels[50]=channel
+        self.bot.settings['command_channel_ids']=[50]
+        self.guild.threads.pop(77)
+        async def run():
+            await poker.add_targets(self.store,10,[77],now=DATE)
+            await poker.run_one(self.bot,self.guild,(await poker.list_targets(self.store,10))[0])
+        with self.assertLogs('dnd_scheduler.forum_poker',level='ERROR'):
+            asyncio.run(run())
+        self.assertIn('77',channel.messages[0])
+        self.assertIn('<#77>',channel.messages[0])
 
     def test_reject_other_guild_and_nonforum_thread(self):
         async def run():
@@ -215,6 +283,9 @@ class ForumPokeTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn('permission',error)
             self.assertEqual(len(channel.messages),1)
+            self.assertIn('Forum thread 77',channel.messages[0])
+            self.assertIn('Rule Reference Forum',channel.messages[0])
+            self.assertIn('77',channel.messages[0])
             row=(await poker.list_targets(self.store,10))[0]
             self.assertEqual(row['next_poke_at'],(DATE+timedelta(hours=1)).isoformat())
             with patch.object(poker,'utcnow',return_value=DATE):
@@ -265,8 +336,10 @@ class ForumPokeTests(unittest.TestCase):
             self.assertIn('Campaign Rules (ID: `77`)', interaction.followup.messages[-1])
             self.assertIn('Character Creation (ID: `88`)', interaction.followup.messages[-1])
             self.assertEqual(len(await poker.list_targets(self.store,10)),2)
-            self.assertEqual(len(self.thread.posts),1)
-            self.assertEqual(len(another.posts),1)
+            self.assertEqual(len(self.thread.posts),0)
+            self.assertEqual(len(another.posts),0)
+            self.assertTrue(self.thread.sent[0].deleted)
+            self.assertTrue(another.sent[0].deleted)
             interaction=Inter(self.guild)
             await command(interaction)
             self.assertIn('No changes made.',interaction.followup.messages[-1])

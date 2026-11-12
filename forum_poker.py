@@ -1,4 +1,4 @@
-"""Independent three-day forum keepalive with one reusable bot-authored message.
+"""Independent three-day forum keepalive with temporary bot messages.
 
 The scheduler and guild_preferences forum_id do not participate. These records
 survive scheduler resets and Fly restarts, using the same persisted SQLite volume.
@@ -84,12 +84,19 @@ async def remove_targets(store, guild_id, thread_ids):
         return store.db.total_changes - before
 
 
-async def record_success(store, guild_id, thread_id, message_id, now=None):
+async def record_sent(store, guild_id, thread_id, message_id):
+    """Remember a new temporary message so failed deletes can be retried."""
+    async with store.lock:
+        store.db.execute('UPDATE forum_pokes SET message_id=? WHERE guild_id=? AND thread_id=?',
+                         (message_id, guild_id, thread_id))
+
+
+async def record_success(store, guild_id, thread_id, now=None):
     at = now or utcnow()
     async with store.lock:
-        store.db.execute('''UPDATE forum_pokes SET message_id=?, last_poked_at=?,
+        store.db.execute('''UPDATE forum_pokes SET message_id=NULL, last_poked_at=?,
             next_poke_at=?, last_error=NULL WHERE guild_id=? AND thread_id=?''',
-            (message_id, at.isoformat(), (at + INTERVAL).isoformat(), guild_id, thread_id))
+            (at.isoformat(), (at + INTERVAL).isoformat(), guild_id, thread_id))
 
 
 async def record_failure(store, guild_id, thread_id, error, now=None):
@@ -145,35 +152,67 @@ async def refresh_activity(thread):
 
 
 async def poke_one(bot, guild, target):
-    """Touch thread activity, then edit the one bot-owned poke message (or send it)."""
+    """Refresh activity, send a silent poke, and immediately delete it.
+
+    The saved message_id from older releases (or a failed deletion) is removed
+    before sending anything new. Never delete another user's message or an
+    unrelated bot message even if its ID was accidentally stored.
+    """
     import discord
     thread = await resolve_forum_thread(bot, guild, target['thread_id'])
     await refresh_activity(thread)
-    content = f"Poked on: **{utcnow():%m/%d/%Y}**"  # UTC calendar date.
-    message = None
     if target.get('message_id'):
         try:
-            candidate = await thread.fetch_message(target['message_id'])
-            if candidate.author.id == bot.user.id and candidate.content.startswith('Poked on:'):
-                message = candidate
+            previous = await thread.fetch_message(target['message_id'])
         except discord.NotFound:
             pass
-    if message is None:
-        # Recovers a message sent just before a bot restart / DB write failure.
-        async for candidate in thread.history(limit=250):
-            if candidate.author.id == bot.user.id and candidate.content.startswith('Poked on:'):
-                message = candidate
-                break
-    if message is None:
-        message = await thread.send(content, allowed_mentions=discord.AllowedMentions.none(), silent=True)
-    else:
-        await message.edit(content=content, allowed_mentions=discord.AllowedMentions.none())
-    return message.id
+        else:
+            if (previous.author.id == bot.user.id and
+                    previous.content.startswith('Poked on:')):
+                await previous.delete()
+
+    content = f"Poked on: **{utcnow():%m/%d/%Y}**"
+    message = await thread.send(content, allowed_mentions=discord.AllowedMentions.none(),
+                                silent=True)
+    try:
+        # On delete failure, the ID remains in SQLite for the one-hour retry.
+        await record_sent(bot.store, guild.id, target['thread_id'], message.id)
+    finally:
+        await message.delete()
+    # run_one records success only after the temporary message is gone.
+
+
+def _safe_label(value):
+    """Keep user-controlled thread names readable in a Discord alert."""
+    cleaned = re.sub(r'\s+', ' ', str(value)).replace('@', '＠').replace('<', '‹')
+    return re.sub(r'([\\`*_~|>])', r'\\\1', cleaned[:90])
+
+
+async def describe_thread(bot, guild, thread_id):
+    """Include both the forum and thread name when Discord still exposes them."""
+    import discord
+    thread = guild.get_thread(thread_id) or bot.get_channel(thread_id)
+    if thread is None:
+        try:
+            thread = await bot.fetch_channel(thread_id)
+        except (discord.HTTPException, ValueError):
+            pass  # Deleted/inaccessible: the ID still identifies the target.
+    fallback = f'thread <#{thread_id}> (ID: `{thread_id}`)'
+    if not isinstance(thread, discord.Thread) or thread.guild.id != guild.id:
+        return fallback
+    name = _safe_label(getattr(thread, 'name', None) or f'Thread {thread_id}')
+    label = f'thread **{name}** (<#{thread_id}>, ID: `{thread_id}`)'
+    forum = guild.get_channel(thread.parent_id) or bot.get_channel(thread.parent_id)
+    if isinstance(forum, discord.ForumChannel):
+        forum_name = _safe_label(getattr(forum, 'name', None) or f'Forum {forum.id}')
+        label += f' in forum **{forum_name}** (<#{forum.id}>)'
+    return label
 
 
 async def report_error(bot, guild, thread_id, message):
     """Use only the configured command-channel whitelist for error notices."""
     import discord
+    label = await describe_thread(bot, guild, thread_id)
     settings = bot.preferences_for(guild)
     channels = settings.get('command_channel_ids', [])
     for channel_id in channels:
@@ -181,18 +220,18 @@ async def report_error(bot, guild, thread_id, message):
         if isinstance(channel, discord.TextChannel):
             try:
                 await channel.send(
-                    f'⚠️ `/poke_forums` could not refresh thread `{thread_id}`: {message[:350]}',
+                    f'⚠️ `/poke_forums` could not refresh {label}: {message[:320]}',
                     allowed_mentions=discord.AllowedMentions.none())
                 return
             except discord.HTTPException:
                 log.warning('Could not report forum poke error in channel %s', channel_id)
-    log.error('Forum poke error guild=%s thread=%s: %s', guild.id, thread_id, message)
+    log.error('Forum poke error guild=%s target=%s: %s', guild.id, label, message)
 
 
 async def run_one(bot, guild, target):
     try:
-        message_id = await poke_one(bot, guild, target)
-        await record_success(bot.store, guild.id, target['thread_id'], message_id)
+        await poke_one(bot, guild, target)
+        await record_success(bot.store, guild.id, target['thread_id'])
         return True, None
     except Exception as exc:
         error = f'{type(exc).__name__}: {exc}'

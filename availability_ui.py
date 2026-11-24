@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 import discord
 
 from availability import read_windows, save_windows
+from scheduler_scope import scoped_callback
 
 
 def _sunday(day):
@@ -20,6 +21,7 @@ class AvailabilityVotePanel(discord.ui.View):
         self.bot=bot
         self.guild_id=record['guild_id']
         self.cycle=record['cycle']
+        self.test_mode=bool(record['config'].get('test_mode'))
         self.user_id=user_id
         self.config=record['config']
         self.valid_slots=set(slots)
@@ -136,6 +138,7 @@ class AvailabilityVotePanel(discord.ui.View):
     async def remove_windows(self,interaction):
         await self._change_windows(interaction, remove=True)
 
+    @scoped_callback
     async def _change_windows(self, interaction, *, remove):
         """Apply the requested edit to the latest DB values, then save atomically.
 

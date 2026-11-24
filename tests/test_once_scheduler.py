@@ -5,6 +5,7 @@ methods/functions under test from bot.py's syntax tree.
 """
 import ast
 import asyncio
+from scheduler_scope import scheduler_scope, in_test_scope
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -155,13 +156,15 @@ class OnceTests(unittest.TestCase):
         async def gate(interaction): return True
         (once,) = funcs('test_scheduler', admin_gate=gate,
                         config_defaults=lambda guild, user, ch: {'title': 'Original', 'days': [4], 'times': ['16:00'], 'poll_duration': 3},
-                        is_test=lambda c: c.get('test_mode', False),
+                        is_test=lambda c: c.get('test_mode', False), scheduler_scope=scheduler_scope,
                         ValueError=ValueError, discord=SimpleNamespace(HTTPException=Exception, Interaction=object))
         async def check():
             old_cfg = {'title': 'Campaign', 'days': [4], 'times': ['16:00'], 'poll_duration': 3}
             store = Store({'config': old_cfg})
             seen = []
-            async def replace(guild, cfg): seen.append(cfg)
+            async def replace(guild, cfg):
+                self.assertTrue(in_test_scope())
+                seen.append(cfg)
             once.__globals__['bot'] = SimpleNamespace(store=store, replace_scheduler=replace)
             class Response:
                 async def defer(self, **kwargs): pass
@@ -172,7 +175,7 @@ class OnceTests(unittest.TestCase):
             await once(inter)
             cfg = seen[0]
             self.assertEqual(cfg['title'], 'Test Poll')
-            self.assertEqual(cfg['previous_normal_config']['title'], 'Campaign')
+            self.assertNotIn('previous_normal_config', cfg)
             self.assertFalse(cfg['looping'])
             self.assertTrue(cfg['test_mode'])
             self.assertIsNone(cfg['ping_role_id'])
@@ -181,19 +184,26 @@ class OnceTests(unittest.TestCase):
     def test_worker_skips_reminder_and_finishes_without_loop(self):
         (worker,) = funcs('worker', methods=True, utcnow=lambda: NOW,
                           timedelta=timedelta, dtread=datetime.fromisoformat,
+                          scheduler_scope=scheduler_scope,
                           is_test=lambda c: c.get('test_mode', False),
                           log=SimpleNamespace(exception=lambda *args: None))
         async def check():
             record = {'guild_id': 55, 'state': 'event', 'event_start': (NOW - timedelta(minutes=2)).isoformat(),
                       'event_end': (NOW - timedelta(minutes=1)).isoformat(), 'reminded': 0,
                       'config': {'test_mode': True, 'looping': False, 'reminder_before_event': 6}}
-            store = Store(record)
+            test_store = Store(record)
+            regular_store = Store(None)
+            async def no_records(): return []
+            regular_store.all = no_records
             guild = SimpleNamespace(id=55)
             native = []
             class Bot:
                 def __init__(self):
-                    self.store = store
+                    self.test_store = test_store
                     self._lock = asyncio.Lock()
+                @property
+                def store(self):
+                    return test_store if in_test_scope() else regular_store
                 def get_guild(self, id_): return guild
                 def lock_for(self, guild_id): return self._lock
                 async def send_reminder(self, guild, record): raise AssertionError('test reminder should not run')

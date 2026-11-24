@@ -119,14 +119,15 @@ class ForumHistoryTests(unittest.TestCase):
             def text_channel(self,guild,config):return SimpleNamespace(id=901)
             def forum_channel(self,guild):return SimpleNamespace(id=902)
             def slots_for(self,record):return ['2026-12-10T14:00']
-            async def cleanup(self,guild):self.actions.append('cleanup')
+            async def cleanup(self,guild,*,test_mode=False):
+                self.actions.append('cleanup-test' if test_mode else 'cleanup')
             async def prepare_poll(self,guild,config,cycle):self.actions.append('prepare')
             async def publish_poll(self,guild,record):self.actions.append('publish')
         bot=Bot()
         async def run():
             await replace(bot,SimpleNamespace(id=42),dict(test_mode=True,poll_duration=2))
         asyncio.run(run())
-        self.assertEqual(bot.actions,['cleanup','prepare','publish'])
+        self.assertEqual(bot.actions,['cleanup-test','prepare','publish'])
 
     def test_production_scheduler_still_requires_forum(self):
         replace = get_function('replace_scheduler', method=True,

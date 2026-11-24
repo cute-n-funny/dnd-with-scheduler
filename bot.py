@@ -21,6 +21,7 @@ from heatmap import render_heatmaps
 from availability import (ensure_schema, read_windows, carry_windows,
                           windows_for_heatmap, test_window_votes)
 from availability_ui import AvailabilityVotePanel
+from scheduler_isolation import migrate_legacy_test_runs
 from guild_preferences import (ensure_schema as ensure_preferences_schema,
                                load_all as load_preferences, get as get_preferences,
                                update as update_preferences, defaults as preference_defaults)
@@ -34,6 +35,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 UTC = timezone.utc
 TZ_NAME = os.getenv("TZ_NAME", "America/Chicago")
 DB_PATH = os.getenv("DATABASE_PATH", "./data/scheduler.db")
+# Uses the same persistent /data Fly volume, but never shares campaign rows.
+TEST_DB_PATH = os.getenv("TEST_DATABASE_PATH", DB_PATH + ".test")
 
 
 def utcnow():
@@ -312,24 +315,28 @@ def build_event_embed(record, rsvps):
 
 
 class PollMessageView(discord.ui.View):
-    def __init__(self, bot, guild_id, cycle):
+    def __init__(self, bot, guild_id, cycle, *, test_mode=False):
         super().__init__(timeout=None)
         self.bot, self.guild_id, self.cycle = bot, guild_id, cycle
+        self.test_mode = test_mode
         button = discord.ui.Button(label="Set My Availability", emoji="🗳️",
                                    style=discord.ButtonStyle.primary,
-                                   custom_id=f"dnd:poll:{guild_id}:{cycle}")
+                                   custom_id=(f"dnd:poll:test:{guild_id}:{cycle}"
+                                              if test_mode else f"dnd:poll:{guild_id}:{cycle}"))
         button.callback = self.vote
         self.add_item(button)
 
     async def vote(self, interaction):
-        record = await self.bot.store.get(self.guild_id)
+        store = (getattr(self.bot, "test_store", self.bot.store)
+                 if self.test_mode else self.bot.store)
+        record = await store.get(self.guild_id)
         if not record or record["state"] != "poll" or record["cycle"] != self.cycle or utcnow() >= dtread(record["poll_deadline"]):
             return await interaction.response.send_message("This poll is closed.", ephemeral=True)
         slots = self.bot.slots_for(record)
         if not slots:
             return await interaction.response.send_message("There are no future time slots in this poll.", ephemeral=True)
-        saved = await self.bot.store.user_votes(self.guild_id, self.cycle, interaction.user.id)
-        windows = await read_windows(self.bot.store, self.guild_id, self.cycle, interaction.user.id)
+        saved = await store.user_votes(self.guild_id, self.cycle, interaction.user.id)
+        windows = await read_windows(store, self.guild_id, self.cycle, interaction.user.id)
         panel = AvailabilityVotePanel(self.bot, record, interaction.user.id, slots, windows, saved)
         await interaction.response.send_message(embed=panel.embed(), view=panel, ephemeral=True)
 
@@ -340,6 +347,7 @@ class VotePanel(discord.ui.View):
         super().__init__(timeout=600)
         self.bot, self.guild_id, self.cycle, self.user_id = (
             bot, record["guild_id"], record["cycle"], user_id)
+        self.test_mode = is_test(record["config"])
         self.timezone = record["config"]["timezone"]
         self.slots = set(slots)
         self.days = sorted({slot[:10] for slot in slots})
@@ -477,7 +485,9 @@ class VotePanel(discord.ui.View):
 
     async def copy_previous(self, interaction):
         # Copies weekday/time patterns, not exact dates. Draft only: never auto-saves.
-        old = await self.bot.store.previous_user_votes(self.guild_id, self.cycle, self.user_id)
+        store = (getattr(self.bot, "test_store", self.bot.store)
+                 if self.test_mode else self.bot.store)
+        old = await store.previous_user_votes(self.guild_id, self.cycle, self.user_id)
         if not old:
             return await interaction.response.edit_message(embed=self.embed(
                 "ℹ️ No previous poll preferences found."), view=self)
@@ -498,15 +508,17 @@ class VotePanel(discord.ui.View):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message(
                 "This availability form belongs to someone else.", ephemeral=True)
+        store = (getattr(self.bot, "test_store", self.bot.store)
+                 if self.test_mode else self.bot.store)
         async with self.bot.lock_for(self.guild_id):
-            record = await self.bot.store.get(self.guild_id)
+            record = await store.get(self.guild_id)
             if not record or record["state"] != "poll" or record["cycle"] != self.cycle or utcnow() >= dtread(record["poll_deadline"]):
                 return await interaction.response.send_message(
                     "This poll has closed; your unsaved changes were not recorded.", ephemeral=True)
             if not self.selected <= set(self.bot.slots_for(record)):
                 return await interaction.response.send_message(
                     "Some selected times are no longer valid. Reopen the poll.", ephemeral=True)
-            await self.bot.store.replace_user_votes(self.guild_id, self.cycle,
+            await store.replace_user_votes(self.guild_id, self.cycle,
                                                     self.user_id, self.selected)
         self.saved_slots = set(self.selected)
         self.redraw()
@@ -514,7 +526,10 @@ class VotePanel(discord.ui.View):
         days = len({s[:10] for s in self.saved_slots})
         await interaction.response.edit_message(embed=self.embed(
             f"✅ Saved! **{count}** time slots across **{days}** dates."), view=self)
-        await self.bot.refresh_poll(self.guild_id)
+        if self.test_mode:
+            await self.bot.refresh_poll(self.guild_id, test_mode=True)
+        else:
+            await self.bot.refresh_poll(self.guild_id)
 
 
 def personal_rsvp_embed(record, rsvps, user_id):
@@ -543,6 +558,7 @@ class RsvpManageView(discord.ui.View):
         super().__init__(timeout=240)
         self.bot, self.guild_id, self.cycle, self.user_id = (
             bot, record["guild_id"], record["cycle"], user_id)
+        self.test_mode = is_test(record["config"])
         self.expected_status = status
         confirmed = sum(r["status"] == "confirmed" for r in rsvps)
         if status in ("confirmed", "waitlist"):
@@ -559,27 +575,32 @@ class RsvpManageView(discord.ui.View):
     async def change(self, interaction):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("This RSVP panel belongs to someone else.", ephemeral=True)
+        store = (getattr(self.bot, "test_store", self.bot.store)
+                 if self.test_mode else self.bot.store)
         async with self.bot.lock_for(self.guild_id):
-            record = await self.bot.store.get(self.guild_id)
+            record = await store.get(self.guild_id)
             if not record or record["cycle"] != self.cycle or record["state"] not in ("event", "waiting") or utcnow() >= dtread(record["event_end"]):
                 return await interaction.response.send_message("RSVPs for this session are closed.", ephemeral=True)
-            current = await self.bot.store.rsvps(self.guild_id, self.cycle)
+            current = await store.rsvps(self.guild_id, self.cycle)
             existing = next((r["status"] for r in current if r["user_id"] == self.user_id), "none")
             if existing != self.expected_status:
                 embed, _ = personal_rsvp_embed(record, current, self.user_id)
                 embed.set_footer(text="Your RSVP changed since this panel opened. Review before acting again.")
                 return await interaction.response.edit_message(
                     embed=embed, view=RsvpManageView(self.bot, record, self.user_id, existing, current))
-            result, promoted = await self.bot.store.toggle_rsvp(
+            result, promoted = await store.toggle_rsvp(
                 self.guild_id, self.cycle, self.user_id, record["config"]["attendee_limit"])
-            rsvps = await self.bot.store.rsvps(self.guild_id, self.cycle)
+            rsvps = await store.rsvps(self.guild_id, self.cycle)
         embed, status = personal_rsvp_embed(record, rsvps, self.user_id)
         note = {"confirmed": "✅ Attendance confirmed.", "waitlist": "⏳ Added to the waitlist.",
                 "removed": "✅ Your RSVP was cancelled."}[result]
         embed.set_footer(text=note)
         await interaction.response.edit_message(
             embed=embed, view=RsvpManageView(self.bot, record, self.user_id, status, rsvps))
-        await self.bot.refresh_event(self.guild_id)
+        if self.test_mode:
+            await self.bot.refresh_event(self.guild_id, test_mode=True)
+        else:
+            await self.bot.refresh_event(self.guild_id)
         if promoted and promoted != self.user_id:
             try:
                 person = await self.bot.fetch_user(promoted)
@@ -593,12 +614,15 @@ class EventMessageView(discord.ui.View):
     def __init__(self, bot, record):
         super().__init__(timeout=None)
         self.bot, self.guild_id, self.cycle = bot, record["guild_id"], record["cycle"]
+        self.test_mode = is_test(record["config"])
         rsvp = discord.ui.Button(label="Manage My RSVP", emoji="🎟️", style=discord.ButtonStyle.success,
-                                 custom_id=f"dnd:rsvp:{self.guild_id}:{self.cycle}")
+                                 custom_id=(f"dnd:rsvp:test:{self.guild_id}:{self.cycle}"
+                                            if self.test_mode else f"dnd:rsvp:{self.guild_id}:{self.cycle}"))
         rsvp.callback = self.rsvp
         self.add_item(rsvp)
         ical = discord.ui.Button(label="Download iCal (.ics)", emoji="📅", style=discord.ButtonStyle.secondary,
-                                 custom_id=f"dnd:ical:{self.guild_id}:{self.cycle}")
+                                 custom_id=(f"dnd:ical:test:{self.guild_id}:{self.cycle}"
+                                            if self.test_mode else f"dnd:ical:{self.guild_id}:{self.cycle}"))
         ical.callback = self.ical
         self.add_item(ical)
         c = record["config"]
@@ -607,17 +631,21 @@ class EventMessageView(discord.ui.View):
                 url=google_calendar_url(event_title(c), c["description"][:180], dtread(record["event_start"]), dtread(record["event_end"]))))
 
     async def rsvp(self, interaction):
-        record = await self.bot.store.get(self.guild_id)
+        store = (getattr(self.bot, "test_store", self.bot.store)
+                 if self.test_mode else self.bot.store)
+        record = await store.get(self.guild_id)
         if not record or record["cycle"] != self.cycle or record["state"] not in ("event", "waiting") or utcnow() >= dtread(record["event_end"]):
             return await interaction.response.send_message("RSVPs for this session are closed.", ephemeral=True)
-        rsvps = await self.bot.store.rsvps(self.guild_id, self.cycle)
+        rsvps = await store.rsvps(self.guild_id, self.cycle)
         embed, status = personal_rsvp_embed(record, rsvps, interaction.user.id)
         await interaction.response.send_message(
             embed=embed, view=RsvpManageView(self.bot, record, interaction.user.id, status, rsvps),
             ephemeral=True)
 
     async def ical(self, interaction):
-        record = await self.bot.store.get(self.guild_id)
+        store = (getattr(self.bot, "test_store", self.bot.store)
+                 if self.test_mode else self.bot.store)
+        record = await store.get(self.guild_id)
         if not record or record["cycle"] != self.cycle or not record["event_start"]:
             return await interaction.response.send_message("This calendar event is no longer available.", ephemeral=True)
         c = record["config"]
@@ -633,6 +661,8 @@ class SchedulerBot(commands.Bot):
                          allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=False))
         self.store = Store(DB_PATH)
         ensure_schema(self.store)
+        self.test_store = Store(TEST_DB_PATH)
+        ensure_schema(self.test_store)
         ensure_preferences_schema(self.store)
         ensure_poke_schema(self.store)
         self.preferences_cache = {}
@@ -680,12 +710,18 @@ class SchedulerBot(commands.Bot):
         return {**config, "ping_role_id": self.preferences_for(guild)['ping_role_id']}
 
     async def setup_hook(self):
+        await migrate_legacy_test_runs(self.store, self.test_store)
         self.preferences_cache = await load_preferences(self.store)
-        for r in await self.store.all():
-            if r["state"] == "poll" and r["poll_message_id"]:
-                self.add_view(PollMessageView(self, r["guild_id"], r["cycle"]), message_id=r["poll_message_id"])
-            if r["state"] in ("event", "waiting", "creating_event") and r["event_message_id"]:
-                self.add_view(EventMessageView(self, r), message_id=r["event_message_id"])
+        for store in (self.store, self.test_store):
+            for r in await store.all():
+                test_mode = is_test(r["config"])
+                if (store is self.test_store) != test_mode:
+                    continue
+                if r["state"] == "poll" and r["poll_message_id"]:
+                    self.add_view(PollMessageView(self, r["guild_id"], r["cycle"],
+                                                  test_mode=test_mode), message_id=r["poll_message_id"])
+                if r["state"] in ("event", "waiting", "creating_event") and r["event_message_id"]:
+                    self.add_view(EventMessageView(self, r), message_id=r["event_message_id"])
         # One global command tree lets the bot serve every Discord server.
         # The former GUILD_ID-only registration silently hid commands elsewhere.
         await self.tree.sync()
@@ -785,24 +821,32 @@ class SchedulerBot(commands.Bot):
         except (discord.HTTPException, AttributeError):
             log.info("Could not delete prior bot message %s", message_id)
 
-    async def cleanup(self, guild):
-        old = await self.store.get(guild.id)
+    async def cleanup(self, guild, *, test_mode=False):
+        store = getattr(self, "test_store", self.store) if test_mode else self.store
+        old = await store.get(guild.id)
         if old:
             await self.try_delete_message(guild, old["poll_channel_id"], old["poll_message_id"])
             await self.try_delete_message(guild, old["event_channel_id"], old["event_message_id"])
             # Forum posts are permanent campaign history. Never delete them when
             # starting, resetting, or ending the scheduler.
-        # Delete only future events actually created by this bot, not other admins' events.
+        # Only the selected scheduler mode may delete its native events.
+        tracked = old.get("discord_event_id") if old else None
+        marker = (f"DND-SCHEDULER:TEST:{guild.id}:" if test_mode
+                  else f"DND-SCHEDULER:{guild.id}:")
         try:
             for event in await guild.fetch_scheduled_events():
-                if event.creator_id == self.user.id and (event.start_time > utcnow() or event.status == discord.EventStatus.active):
+                if event.creator_id != self.user.id:
+                    continue
+                if event.id != tracked and marker not in (event.description or ""):
+                    continue
+                if event.start_time > utcnow() or event.status == discord.EventStatus.active:
                     try:
                         await event.delete(reason="D&D scheduler reset/start/end")
                     except discord.HTTPException:
                         log.exception("Could not delete event %s", event.id)
         except discord.HTTPException:
             log.exception("Could not inspect Discord Scheduled Events")
-        await self.store.delete(guild.id)
+        await store.delete(guild.id)
 
     async def replace_scheduler(self, guild, config):
         async with self.lock_for(guild.id):
@@ -817,26 +861,31 @@ class SchedulerBot(commands.Bot):
             fake = {"config": config, "poll_deadline": (utcnow() + window).isoformat()}
             if not self.slots_for(fake):
                 raise ValueError("No valid dates/times remain after poll close; change the weekdays, times, or weeks.")
-            await self.cleanup(guild)
+            await self.cleanup(guild, test_mode=is_test(config))
             await self.prepare_poll(guild, config, 1)
-            await self.publish_poll(guild, await self.store.get(guild.id))
+            store = getattr(self, "test_store", self.store) if is_test(config) else self.store
+            await self.publish_poll(guild, await store.get(guild.id))
 
     async def prepare_poll(self, guild, config, cycle):
+        store = (getattr(self, "test_store", self.store)
+                 if is_test(config) else self.store)
         now = utcnow()
         deadline = now + (timedelta(minutes=1) if is_test(config) else timedelta(days=config["poll_duration"]))
-        await self.store.put(guild.id, config, cycle, "poll_preparing",
+        await store.put(guild.id, config, cycle, "poll_preparing",
                              poll_deadline=deadline.isoformat(), poll_channel_id=config["channel_id"])
         # Future dates already voted on in the previous cycle remain valid. Transfer
         # exact matching slots only, preserving voter identity and RSVP priority.
         if cycle > 1 and not is_test(config):
-            record = await self.store.get(guild.id)
-            copied = await self.store.carry_forward_votes(
+            record = await store.get(guild.id)
+            copied = await store.carry_forward_votes(
                 guild.id, cycle - 1, cycle, self.slots_for(record))
             if copied:
                 log.info("Carried %s overlapping availability votes into cycle %s", copied, cycle)
 
     async def publish_poll(self, guild, record):
         if record["state"] != "poll_preparing": return
+        store = (getattr(self, "test_store", self.store)
+                 if is_test(record["config"]) else self.store)
         channel = self.text_channel(guild, record["config"])
         if not channel:
             raise ValueError("Scheduling text channel is missing")
@@ -845,14 +894,15 @@ class SchedulerBot(commands.Bot):
         # Recover vote carry-over if an earlier process stopped after the new
         # cycle was written but before the transfer finished.
         if record["cycle"] > 1 and not is_test(record["config"]):
-            await self.store.carry_forward_votes(
+            await store.carry_forward_votes(
                 guild.id, record["cycle"] - 1, record["cycle"], self.slots_for(record))
-        view = PollMessageView(self, guild.id, record["cycle"])
-        votes = await self.store.votes(guild.id, record["cycle"])
+        view = PollMessageView(self, guild.id, record["cycle"],
+                               test_mode=is_test(record["config"]))
+        votes = await store.votes(guild.id, record["cycle"])
         if record["cycle"] > 1 and not is_test(record["config"]):
-            await carry_windows(self.store, guild.id, record["cycle"] - 1,
+            await carry_windows(store, guild.id, record["cycle"] - 1,
                                 record["cycle"], self.slots_for(record))
-        windows = await read_windows(self.store, guild.id, record["cycle"])
+        windows = await read_windows(store, guild.id, record["cycle"])
         embeds, files = build_window_visual_poll(record, votes, windows)
         # Explicitly permit only role pings (never @everyone), even when the
         # image-upload fallback is used. Test mode's mention() stays empty.
@@ -868,17 +918,18 @@ class SchedulerBot(commands.Bot):
             message = await channel.send(content=mention(self.role_config(guild, record["config"]), guild),
                                          embed=embeds[0], view=view,
                                          allowed_mentions=allowed)
-        await self.store.update(guild.id, state="poll", poll_message_id=message.id)
+        await store.update(guild.id, state="poll", poll_message_id=message.id)
         log.info("Published poll guild=%s cycle=%s", guild.id, record["cycle"])
 
-    async def refresh_poll(self, guild_id):
-        record = await self.store.get(guild_id)
+    async def refresh_poll(self, guild_id, *, test_mode=False):
+        store = getattr(self, "test_store", self.store) if test_mode else self.store
+        record = await store.get(guild_id)
         if not record or record["state"] != "poll" or not record["poll_message_id"]: return
         try:
             channel = self.get_channel(record["poll_channel_id"]) or await self.fetch_channel(record["poll_channel_id"])
             message = await channel.fetch_message(record["poll_message_id"])
-            votes = await self.store.votes(guild_id, record["cycle"])
-            windows = await read_windows(self.store, guild_id, record["cycle"])
+            votes = await store.votes(guild_id, record["cycle"])
+            windows = await read_windows(store, guild_id, record["cycle"])
             embeds, files = build_window_visual_poll(record, votes, windows)
             try:
                 # Replacing attachments on the original poll message means
@@ -891,14 +942,16 @@ class SchedulerBot(commands.Bot):
             log.exception("Poll refresh failed")
 
     async def close_poll(self, guild, record):
-        votes = await self.store.votes(guild.id, record["cycle"])
+        store = (getattr(self, "test_store", self.store)
+                 if is_test(record["config"]) else self.store)
+        votes = await store.votes(guild.id, record["cycle"])
         slots = [s for s in self.slots_for(record) if event_datetimes(s, record["config"])[0] > utcnow() + timedelta(minutes=5)]
         if is_test(record["config"]):
             # Test runs still choose a winning *voted poll slot*, even though
             # the simulated event starts one minute after the poll closes.
             # A three-hour availability window must count for this one-minute
             # test, regardless of the normal event_duration (often four hours).
-            windows = await read_windows(self.store, guild.id, record["cycle"])
+            windows = await read_windows(store, guild.id, record["cycle"])
             votes = test_window_votes(votes, windows, slots)
         # min_votes is distinct people on a calendar DATE, not raw slots/clicks.
         # Test mode bypasses the minimum, preserving its one-vote/zero-vote smoke tests.
@@ -910,7 +963,7 @@ class SchedulerBot(commands.Bot):
             try:
                 channel = self.get_channel(record["poll_channel_id"]) or await self.fetch_channel(record["poll_channel_id"])
                 msg = await channel.fetch_message(record["poll_message_id"])
-                windows = await read_windows(self.store, guild.id, record["cycle"])
+                windows = await read_windows(store, guild.id, record["cycle"])
                 embeds, files = build_window_visual_poll(record, votes, windows,
                                                          closed=True, winner=chosen)
                 try:
@@ -926,7 +979,7 @@ class SchedulerBot(commands.Bot):
             delay = timedelta(hours=12 * record["config"]["poll_duration"])
             next_at = utcnow() + delay
             log.info("No eligible date in guild %s; retrying poll at %s", guild.id, next_at)
-            await self.store.update(guild.id, state="waiting_retry",
+            await store.update(guild.id, state="waiting_retry",
                                     next_poll_at=next_at.isoformat(), selected_slot=None)
             return
         if is_test(record["config"]):
@@ -937,16 +990,18 @@ class SchedulerBot(commands.Bot):
             end = start + timedelta(minutes=1)
         else:
             start, end = event_datetimes(chosen, record["config"])
-        await self.store.set_initial_rsvps(guild.id, record["cycle"], users,
+        await store.set_initial_rsvps(guild.id, record["cycle"], users,
                                            record["config"]["attendee_limit"])
-        await self.store.update(guild.id, state="creating_event", selected_slot=chosen,
+        await store.update(guild.id, state="creating_event", selected_slot=chosen,
                                 event_start=start.isoformat(), event_end=end.isoformat())
-        await self.create_event(guild, await self.store.get(guild.id))
+        await self.create_event(guild, await store.get(guild.id))
 
     async def create_event(self, guild, record):
         c = record["config"]
+        store = getattr(self, "test_store", self.store) if is_test(c) else self.store
         start, end = dtread(record["event_start"]), dtread(record["event_end"])
-        marker = f"DND-SCHEDULER:{guild.id}:{record['cycle']}"
+        marker = (f"DND-SCHEDULER:TEST:{guild.id}:{record['cycle']}"
+                  if is_test(c) else f"DND-SCHEDULER:{guild.id}:{record['cycle']}")
         event_id = record["discord_event_id"]
         if self.preferences_for(guild)['activate_discord_events'] and not event_id:
             # Find prior matching event on an interrupted create, avoiding duplicates.
@@ -969,7 +1024,7 @@ class SchedulerBot(commands.Bot):
                                            else "Discord — see session forum post"))
                 event = await guild.create_scheduled_event(**params)
                 event_id = event.id
-            await self.store.update(guild.id, discord_event_id=event_id)
+            await store.update(guild.id, discord_event_id=event_id)
         thread_id = record["forum_thread_id"]
         if not thread_id and not is_test(c):
             forum = self.forum_channel(guild)
@@ -984,32 +1039,35 @@ class SchedulerBot(commands.Bot):
             created = await forum.create_thread(name=f"{event_title(c)} — {start.astimezone(ZoneInfo(c['timezone'])).strftime('%b %d')}",
                                                 content=message)
             thread_id = created.thread.id
-            await self.store.update(guild.id, forum_thread_id=thread_id)
-        record = await self.store.get(guild.id)
+            await store.update(guild.id, forum_thread_id=thread_id)
+        record = await store.get(guild.id)
         if not record["event_message_id"]:
             channel = self.text_channel(guild, c)
             if not channel: raise ValueError("Scheduling channel not found")
-            rsvps = await self.store.rsvps(guild.id, record["cycle"])
+            rsvps = await store.rsvps(guild.id, record["cycle"])
             msg = await channel.send(content=session_announcement(self.role_config(guild, c), guild, rsvps),
                                      embed=build_event_embed(record, rsvps),
                                      view=EventMessageView(self, record),
                                      allowed_mentions=discord.AllowedMentions(
                                          everyone=False, roles=True, users=False))
-            await self.store.update(guild.id, event_channel_id=channel.id, event_message_id=msg.id)
-        await self.store.update(guild.id, state="event")
+            await store.update(guild.id, event_channel_id=channel.id, event_message_id=msg.id)
+        await store.update(guild.id, state="event")
         log.info("Created session event guild=%s cycle=%s", guild.id, record["cycle"])
 
-    async def refresh_event(self, guild_id):
-        record = await self.store.get(guild_id)
+    async def refresh_event(self, guild_id, *, test_mode=False):
+        store = getattr(self, "test_store", self.store) if test_mode else self.store
+        record = await store.get(guild_id)
         if not record or not record["event_message_id"]: return
         try:
             channel = self.get_channel(record["event_channel_id"]) or await self.fetch_channel(record["event_channel_id"])
             msg = await channel.fetch_message(record["event_message_id"])
-            await msg.edit(embed=build_event_embed(record, await self.store.rsvps(guild_id, record["cycle"])))
+            await msg.edit(embed=build_event_embed(record, await store.rsvps(guild_id, record["cycle"])))
         except discord.HTTPException:
             log.exception("RSVP message refresh failed")
 
     async def send_reminder(self, guild, record):
+        store = (getattr(self, "test_store", self.store)
+                 if is_test(record["config"]) else self.store)
         channel = self.text_channel(guild, record["config"])
         if not channel:
             raise ValueError("Scheduling text channel missing")
@@ -1017,11 +1075,13 @@ class SchedulerBot(commands.Bot):
         await channel.send(f"⏰ {mention(self.role_config(guild, record['config']), guild)} **{record['config']['title']}** begins <t:{when}:R>! "
                            f"RSVP: https://discord.com/channels/{guild.id}/{record['event_channel_id']}/{record['event_message_id']}",
                            allowed_mentions=discord.AllowedMentions(everyone=False, roles=True, users=False))
-        await self.store.update(guild.id, reminded=1)
+        await store.update(guild.id, reminded=1)
 
 
     async def sync_native_event(self, guild, record, *, finish=False):
         """Start/end the native Discord Event on schedule; safe across restarts."""
+        store = (getattr(self, "test_store", self.store)
+                 if is_test(record["config"]) else self.store)
         id_ = record["discord_event_id"]
         flag = "native_ended" if finish else "native_started"
         if not id_ or record[flag]:
@@ -1034,10 +1094,10 @@ class SchedulerBot(commands.Bot):
             else:
                 if event.status == discord.EventStatus.scheduled:
                     await event.start(reason="Scheduled D&D session starting")
-            await self.store.update(guild.id, **{flag: 1})
+            await store.update(guild.id, **{flag: 1})
         except discord.NotFound:
             log.warning("Native Discord event %s no longer exists", id_)
-            await self.store.update(guild.id, **{flag: 1})
+            await store.update(guild.id, **{flag: 1})
         except (discord.HTTPException, ValueError):
             log.exception("Native Discord event lifecycle action failed: %s", id_)
 
@@ -1045,39 +1105,43 @@ class SchedulerBot(commands.Bot):
     # schedules still only perform actions when their saved deadline is due).
     @tasks.loop(seconds=5)
     async def worker(self):
-        for row in await self.store.all():
-            guild = self.get_guild(row["guild_id"])
-            if not guild: continue
-            if self.lock_for(guild.id).locked(): continue
-            async with self.lock_for(guild.id):
-                try:
-                    r = await self.store.get(guild.id)
-                    if not r: continue
-                    now = utcnow()
-                    if r["state"] == "poll_preparing":
-                        await self.publish_poll(guild, r)
-                    elif r["state"] == "poll" and now >= dtread(r["poll_deadline"]):
-                        await self.close_poll(guild, r)
-                    elif r["state"] == "creating_event":
-                        await self.create_event(guild, r)
-                    elif r["state"] == "event":
-                        start, end = dtread(r["event_start"]), dtread(r["event_end"])
-                        if not is_test(r["config"]) and not r["reminded"] and start - timedelta(hours=r["config"]["reminder_before_event"]) <= now < end:
-                            await self.send_reminder(guild, r)
-                        if start <= now < end:
-                            await self.sync_native_event(guild, r)
-                        if now >= end:
-                            await self.sync_native_event(guild, r, finish=True)
-                            if r["config"]["looping"]:
-                                next_at = end + timedelta(hours=r["config"]["poll_after_event"])
-                                await self.store.update(guild.id, state="waiting", next_poll_at=next_at.isoformat())
-                            else:
-                                await self.store.update(guild.id, state="finished")
-                    elif r["state"] in ("waiting", "waiting_retry") and now >= dtread(r["next_poll_at"]):
-                        await self.prepare_poll(guild, r["config"], r["cycle"] + 1)
-                        await self.publish_poll(guild, await self.store.get(guild.id))
-                except Exception:
-                    log.exception("Scheduler tick failed for guild %s", guild.id)
+        for store, test_mode in ((self.store, False),
+                                 (getattr(self, "test_store", None), True)):
+            if store is None: continue
+            for row in await store.all():
+                if getattr(self, "test_store", None) is not None and is_test(row["config"]) != test_mode: continue
+                guild = self.get_guild(row["guild_id"])
+                if not guild: continue
+                if self.lock_for(guild.id).locked(): continue
+                async with self.lock_for(guild.id):
+                    try:
+                        r = await store.get(guild.id)
+                        if not r: continue
+                        now = utcnow()
+                        if r["state"] == "poll_preparing":
+                            await self.publish_poll(guild, r)
+                        elif r["state"] == "poll" and now >= dtread(r["poll_deadline"]):
+                            await self.close_poll(guild, r)
+                        elif r["state"] == "creating_event":
+                            await self.create_event(guild, r)
+                        elif r["state"] == "event":
+                            start, end = dtread(r["event_start"]), dtread(r["event_end"])
+                            if not is_test(r["config"]) and not r["reminded"] and start - timedelta(hours=r["config"]["reminder_before_event"]) <= now < end:
+                                await self.send_reminder(guild, r)
+                            if start <= now < end:
+                                await self.sync_native_event(guild, r)
+                            if now >= end:
+                                await self.sync_native_event(guild, r, finish=True)
+                                if r["config"]["looping"]:
+                                    next_at = end + timedelta(hours=r["config"]["poll_after_event"])
+                                    await store.update(guild.id, state="waiting", next_poll_at=next_at.isoformat())
+                                else:
+                                    await store.update(guild.id, state="finished")
+                        elif r["state"] in ("waiting", "waiting_retry") and now >= dtread(r["next_poll_at"]):
+                            await self.prepare_poll(guild, r["config"], r["cycle"] + 1)
+                            await self.publish_poll(guild, await store.get(guild.id))
+                    except Exception:
+                        log.exception("Scheduler tick failed for guild %s", guild.id)
 
     @worker.before_loop
     async def before_worker(self):

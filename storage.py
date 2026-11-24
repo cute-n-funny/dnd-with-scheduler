@@ -2,8 +2,19 @@
 import asyncio
 import json
 import sqlite3
+from calendar import monthrange
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _poll_retention_cutoff(now=None):
+    """Three calendar months ago in UTC, clamping end-of-month dates."""
+    instant = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    year, zero_month = divmod(instant.year * 12 + instant.month - 1 - 3, 12)
+    month = zero_month + 1
+    return instant.replace(year=year, month=month,
+                           day=min(instant.day, monthrange(year, month)[1]))
+
 
 class Store:
     def __init__(self, path: str):
@@ -42,12 +53,33 @@ class Store:
             guild_id INTEGER PRIMARY KEY,
             cleared_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS poll_cycles (
+            guild_id INTEGER NOT NULL,
+            cycle INTEGER NOT NULL,
+            poll_deadline TEXT NOT NULL,
+            PRIMARY KEY (guild_id, cycle)
+        );
         """)
         # Safe upgrade for an existing SQLite volume from an earlier release.
         current = {r[1] for r in self.db.execute("PRAGMA table_info(schedulers)")}
         for col in ("native_started", "native_ended"):
             if col not in current:
                 self.db.execute(f"ALTER TABLE schedulers ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+        # Backfill a running poll with its actual deadline. Older cycles lacked
+        # per-cycle dates, so preserve them for three months FROM THIS UPGRADE
+        # rather than guessing from vote timestamps (which may be carried over).
+        self.db.execute(
+            "INSERT OR IGNORE INTO poll_cycles (guild_id,cycle,poll_deadline) "
+            "SELECT guild_id,cycle,poll_deadline FROM schedulers WHERE poll_deadline IS NOT NULL")
+        first_seen = datetime.now(timezone.utc).isoformat()
+        for table in ("votes", "rsvps", "availability_windows"):
+            if not self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone():
+                continue
+            self.db.execute(
+                "INSERT OR IGNORE INTO poll_cycles (guild_id,cycle,poll_deadline) "
+                f"SELECT DISTINCT guild_id,cycle,? FROM {table}", (first_seen,))
 
     async def legacy_commands_cleared(self, guild_id):
         async with self.lock:
@@ -80,7 +112,38 @@ class Store:
         async with self.lock:
             cols = list(values)
             sql = f"INSERT OR REPLACE INTO schedulers ({','.join(cols)}) VALUES ({','.join('?' for _ in cols)})"
-            self.db.execute(sql, tuple(values.values()))
+            # One transaction keeps poll creation and periodic pruning together.
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(sql, tuple(values.values()))
+                if state == "poll_preparing" and fields.get("poll_deadline"):
+                    self.db.execute(
+                        "INSERT INTO poll_cycles (guild_id,cycle,poll_deadline) VALUES (?,?,?) "
+                        "ON CONFLICT(guild_id,cycle) DO UPDATE SET poll_deadline=excluded.poll_deadline",
+                        (guild_id, cycle, fields["poll_deadline"]))
+                    # Prune ONLY older cycles in THIS guild and THIS database.
+                    # The bot has separate live/test Store instances. Every
+                    # new poll triggers this; no periodic background scan.
+                    expired = self.db.execute(
+                        "SELECT cycle FROM poll_cycles WHERE guild_id=? AND cycle<? "
+                        "AND julianday(poll_deadline)<julianday(?)",
+                        (guild_id, cycle, _poll_retention_cutoff().isoformat())
+                    ).fetchall()
+                    if expired:
+                        keys = [(guild_id, row["cycle"]) for row in expired]
+                        for table in ("votes", "rsvps", "poll_cycles"):
+                            self.db.executemany(
+                                f"DELETE FROM {table} WHERE guild_id=? AND cycle=?", keys)
+                        if self.db.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='availability_windows'"
+                        ).fetchone():
+                            self.db.executemany(
+                                "DELETE FROM availability_windows WHERE guild_id=? AND cycle=?", keys)
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
 
     async def update(self, guild_id, **fields):
         if not fields: return
@@ -98,7 +161,7 @@ class Store:
             if self.db.execute("SELECT 1 FROM sqlite_master "
                                "WHERE type='table' AND name='availability_windows'").fetchone():
                 self.db.execute("DELETE FROM availability_windows WHERE guild_id=?", (guild_id,))
-            for table in ("votes", "rsvps", "schedulers"):
+            for table in ("votes", "rsvps", "poll_cycles", "schedulers"):
                 self.db.execute(f"DELETE FROM {table} WHERE guild_id=?", (guild_id,))
 
     async def votes(self, guild_id, cycle):

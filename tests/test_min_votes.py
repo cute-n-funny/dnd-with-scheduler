@@ -12,6 +12,7 @@ import unittest
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from logic import choose_slot
+from scheduler_scope import in_test_scope, scheduler_scope
 
 NOW = datetime(2026, 12, 1, 12, tzinfo=timezone.utc)
 SLOT_A = "2026-12-11T14:00"
@@ -174,13 +175,21 @@ class MinVotesTests(unittest.TestCase):
         store = MemoryStore(record)
         when = [NOW]
         worker = source_function('worker', method=True,
+                                 scheduler_scope=scheduler_scope,
                                  utcnow=lambda: when[0],
                                  dtread=datetime.fromisoformat,
                                  timedelta=timedelta,
                                  is_test=lambda c: False,
                                  log=SimpleNamespace(exception=lambda *args: None))
         class Bot:
-            def __init__(self): self.store = store; self.lock = asyncio.Lock(); self.actions = []
+            def __init__(self):
+                self.lock = asyncio.Lock()
+                self.actions = []
+            async def empty_test_rows(self):
+                return []
+            @property
+            def store(self):
+                return SimpleNamespace(all=self.empty_test_rows) if in_test_scope() else store
             def get_guild(self, guild_id): return SimpleNamespace(id=42)
             def lock_for(self, guild_id): return self.lock
             async def prepare_poll(self, guild, config, cycle):

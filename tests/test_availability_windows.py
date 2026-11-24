@@ -13,6 +13,7 @@ from PIL import Image
 from availability import ensure_schema, read_windows, save_windows, carry_windows, _qualifying_slots
 from heatmap import _color, _week_start, LIGHT_GREEN, GREEN, RED, ORANGE, render_heatmaps
 from logic import parse_days, parse_times
+from scheduler_scope import scoped_callback
 
 
 class DummyStore:
@@ -110,7 +111,8 @@ class AvailabilityTests(unittest.TestCase):
         discord=SimpleNamespace(ui=SimpleNamespace(View=FakeView,Select=FakeSelect,Button=FakeButton),
                                 SelectOption=FakeOption,ButtonStyle=styles,Embed=FakeEmbed)
         ns=dict(discord=discord,date=date,datetime=datetime,timedelta=timedelta,timezone=timezone,
-                read_windows=read_windows,save_windows=save_windows)
+                read_windows=read_windows,save_windows=save_windows,
+                scoped_callback=scoped_callback)
         exec(compile(ast.Module(body=nodes,type_ignores=[]),'availability_ui.py','exec'),ns)
         weekdays=[(date(2026,11,1)+timedelta(days=i)).isoformat() for i in range(28)]
         slots=[f'{d}T14:00' for d in weekdays]

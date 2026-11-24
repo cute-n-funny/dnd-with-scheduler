@@ -14,6 +14,7 @@ import unittest
 
 from logic import event_datetimes, slot_keys
 from storage import Store
+from scheduler_scope import scoped_callback
 
 
 class FakeEmbed:
@@ -74,6 +75,7 @@ def ui_from_bot():
         ButtonStyle=SimpleNamespace(success=1, danger=2, secondary=3, primary=4))
     from datetime import datetime as dt
     ns = {'discord': discord, 'datetime': dt, 'Counter': Counter, 'timedelta': timedelta,
+          'scoped_callback': scoped_callback,
           'utcnow': lambda: datetime.now(timezone.utc),
           'dtread': datetime.fromisoformat, 'slot_keys': slot_keys,
           'poll_start': lambda r: datetime.fromisoformat(r['poll_deadline']) - timedelta(days=r['config']['poll_duration']),

@@ -13,6 +13,7 @@ import unittest
 from zoneinfo import ZoneInfo
 
 from logic import parse_times
+from scheduler_scope import in_test_scope, scheduler_scope
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ast.parse((ROOT / 'bot.py').read_text(encoding='utf-8'))
@@ -27,6 +28,7 @@ def get_function(name, *, method=False, **bindings):
                               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name))
     node.decorator_list = []
     ns = dict(bindings)
+    ns.setdefault('in_test_scope', in_test_scope)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
                  'bot.py', 'exec'), ns)
     return ns[name]
@@ -88,7 +90,8 @@ class ForumHistoryTests(unittest.TestCase):
             log=SimpleNamespace(exception=lambda *a:None, warning=lambda *a:None))
         guild = DummyGuild()
         record = dict(poll_channel_id=2,poll_message_id=10,
-                      event_channel_id=2,event_message_id=11,forum_thread_id=777)
+                      event_channel_id=2,event_message_id=11,forum_thread_id=777,
+                      discord_event_id=None)
         store = TestStore(record)
         class Bot:
             def __init__(self):
@@ -124,7 +127,8 @@ class ForumHistoryTests(unittest.TestCase):
             async def publish_poll(self,guild,record):self.actions.append('publish')
         bot=Bot()
         async def run():
-            await replace(bot,SimpleNamespace(id=42),dict(test_mode=True,poll_duration=2))
+            with scheduler_scope(True):
+                await replace(bot,SimpleNamespace(id=42),dict(test_mode=True,poll_duration=2))
         asyncio.run(run())
         self.assertEqual(bot.actions,['cleanup','prepare','publish'])
 
@@ -140,7 +144,8 @@ class ForumHistoryTests(unittest.TestCase):
             asyncio.run(replace(Bot(),SimpleNamespace(id=42),dict(test_mode=False)))
         # The same required preference applies to the one-minute test command.
         with self.assertRaisesRegex(ValueError, 'channel-for-forum is not set'):
-            asyncio.run(replace(Bot(),SimpleNamespace(id=42),dict(test_mode=True)))
+            with scheduler_scope(True):
+                asyncio.run(replace(Bot(),SimpleNamespace(id=42),dict(test_mode=True)))
 
     def make_create_event(self):
         fake_discord=SimpleNamespace(

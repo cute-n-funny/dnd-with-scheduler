@@ -22,7 +22,6 @@ class AvailabilityVotePanel(discord.ui.View):
         self.cycle=record['cycle']
         self.user_id=user_id
         self.config=record['config']
-        self.test_mode=bool(self.config.get('test_mode',False))
         self.valid_slots=set(slots)
         self.days=sorted({s[:10] for s in slots})
         self.times=sorted({s[11:] for s in slots})
@@ -153,10 +152,8 @@ class AvailabilityVotePanel(discord.ui.View):
             return await interaction.response.edit_message(
                 embed=self.embed('Select one or more start times first.'), view=self)
         edits={(day,start) for day in self.target_days for start in self.target_starts}
-        store = (getattr(self.bot, "test_store", self.bot.store)
-                 if self.test_mode else self.bot.store)
         async with self.bot.lock_for(self.guild_id):
-            record=await store.get(self.guild_id)
+            record=await self.bot.store.get(self.guild_id)
             if not record or record['state']!='poll' or record['cycle']!=self.cycle or datetime.now(timezone.utc)>=datetime.fromisoformat(record['poll_deadline']):
                 return await interaction.response.edit_message(
                     embed=self.embed('This poll has closed. Reopen a current poll to vote.'),
@@ -169,11 +166,11 @@ class AvailabilityVotePanel(discord.ui.View):
 
             # Read the latest vote state under the guild lock to prevent two
             # concurrently open ephemeral panels from clobbering each other.
-            existing=await read_windows(store,self.guild_id,self.cycle,self.user_id)
+            existing=await read_windows(self.bot.store,self.guild_id,self.cycle,self.user_id)
             windows={(w['day'],w['start']):int(w['hours']) for w in existing}
             if not existing:
                 # Preserve ballots created with the older, per-slot voting UI.
-                previous_votes=await store.user_votes(self.guild_id,self.cycle,self.user_id)
+                previous_votes=await self.bot.store.user_votes(self.guild_id,self.cycle,self.user_id)
                 legacy_hours=min(self.max_hours, record['config']['event_duration'])
                 windows={(v['slot'][:10],v['slot'][11:]):legacy_hours
                          for v in previous_votes if v['slot'] in slots}
@@ -188,7 +185,7 @@ class AvailabilityVotePanel(discord.ui.View):
                 required_hours = (1 / 60 if record['config'].get('test_mode')
                                   else record['config']['event_duration'])
                 qualifying=await save_windows(
-                    store,self.guild_id,self.cycle,self.user_id,
+                    self.bot.store,self.guild_id,self.cycle,self.user_id,
                     [(day,start,h) for (day,start),h in windows.items()],
                     slots,required_hours,self.max_hours)
             except ValueError:
@@ -201,10 +198,7 @@ class AvailabilityVotePanel(discord.ui.View):
         await interaction.response.edit_message(embed=self.embed(
             f'✅ {action} {len(edits)} date/time combination(s) and saved automatically. '
             f'{qualifying} eligible session start(s).'),view=self)
-        if self.test_mode:
-            await self.bot.refresh_poll(self.guild_id, test_mode=True)
-        else:
-            await self.bot.refresh_poll(self.guild_id)
+        await self.bot.refresh_poll(self.guild_id)
 
     async def close(self,interaction):
         if interaction.user.id != self.user_id:
